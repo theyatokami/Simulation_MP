@@ -36,7 +36,7 @@ classdef ROVSimGUI < matlab.apps.AppBase
         function startup(app)
             % Load STL geometry
             scriptDir = fileparts(mfilename('fullpath'));
-            stlFile = fullfile(scriptDir, 'Preliminary-ROV.stl');
+            stlFile = fullfile(scriptDir, '..', 'Preliminary-ROV.stl');
             if ~isfile(stlFile)
                 error('STL not found: %s', stlFile);
             end
