@@ -8,11 +8,13 @@ classdef ROVSimGUI < matlab.apps.AppBase
         SimulationTab            matlab.ui.container.Tab
         VisualizationTab         matlab.ui.container.Tab
         ResultsTab               matlab.ui.container.Tab
+        DragFittingTab           matlab.ui.container.Tab
         
         % Control buttons
         LoadANSYSButton          matlab.ui.control.Button
         RunSimButton             matlab.ui.control.Button
         ResetButton              matlab.ui.control.Button
+        FitDragButton            matlab.ui.control.Button
         
         % Parameters Tab Controls
         BasicPropsPanel          matlab.ui.container.Panel
@@ -53,6 +55,12 @@ classdef ROVSimGUI < matlab.apps.AppBase
         UIAxesError              matlab.ui.control.UIAxes
         UIAxesControlEffort      matlab.ui.control.UIAxes
         ResultsTextArea          matlab.ui.control.TextArea
+
+        % Drag Fitting Tab Controls
+        LinearDragTable          matlab.ui.control.Table
+        RotationalDragTable      matlab.ui.control.Table
+        UIAxesLinearDrag         matlab.ui.control.UIAxes
+        UIAxesRotationalDrag     matlab.ui.control.UIAxes
     end
 
     properties (Access = private)
@@ -73,7 +81,6 @@ classdef ROVSimGUI < matlab.apps.AppBase
             stlFile = fullfile(scriptDir, 'Preliminary-ROV.stl');
             if ~isfile(stlFile)
                 warning('Geometric model not found: %s. Using default geometry.', stlFile);
-                % Create a simple box geometry as fallback
                 [x, y, z] = meshgrid([-0.5, 0.5], [-0.2, 0.2], [-0.1, 0.1]);
                 app.vertices = [x(:), y(:), z(:)];
                 app.faces = convhull(app.vertices);
@@ -103,6 +110,8 @@ classdef ROVSimGUI < matlab.apps.AppBase
             p.ts = 0.1;
             p.t_final = 120;
             p.desired = [20; 20; 20; 0; 0; 0]; % Desired pose [x, y, z, roll, pitch, yaw]
+            p.polyDragLin = []; % Polynomial coefficients for linear drag (3x6)
+            p.polyDragRot = []; % Polynomial coefficients for rotational drag (3x6)
             app.simParams = p;
 
             % Populate UI tables and fields
@@ -116,6 +125,8 @@ classdef ROVSimGUI < matlab.apps.AppBase
             app.ThrusterConfigTable.Data = [p.r_pos, p.dir_thr];
             app.GainsTable.Data = [diag(p.Kp), diag(p.Ki), diag(p.Kd)];
             app.DesiredPoseTable.Data = p.desired';
+            app.LinearDragTable.Data = [-1:0.2:1; zeros(1,11)]'; % Default velocity range
+            app.RotationalDragTable.Data = [-1:0.2:1; zeros(1,11)]';
         end
 
         function LoadANSYS(app, ~, ~)
@@ -132,6 +143,72 @@ classdef ROVSimGUI < matlab.apps.AppBase
             app.startup();
         end
 
+        function FitDragPolynomials(app, ~, ~)
+            try
+                % Get data from tables
+                linData = app.LinearDragTable.Data;
+                rotData = app.RotationalDragTable.Data;
+                
+                % Validate input
+                if isempty(linData) || isempty(rotData)
+                    uialert(app.UIFigure, 'Drag tables cannot be empty.', 'Input Error');
+                    return;
+                end
+                if any(isnan(linData(:))) || any(isnan(rotData(:)))
+                    uialert(app.UIFigure, 'Drag tables contain invalid (NaN) values.', 'Input Error');
+                    return;
+                end
+                if any(abs(linData(:,1)) > 1) || any(abs(rotData(:,1)) > 1)
+                    uialert(app.UIFigure, 'Velocities must be within [-1, 1] m/s or rad/s.', 'Input Error');
+                    return;
+                end
+                if size(linData, 1) < 6 || size(rotData, 1) < 6
+                    uialert(app.UIFigure, 'At least 6 data points are required for quintic polynomial fit.', 'Input Error');
+                    return;
+                end
+
+                % Fit quintic polynomials
+                app.simParams.polyDragLin = zeros(3, 6);
+                app.simParams.polyDragRot = zeros(3, 6);
+                for i = 1:3
+                    app.simParams.polyDragLin(i, :) = polyfit(linData(:,1), linData(:,i+1), 5);
+                    app.simParams.polyDragRot(i, :) = polyfit(rotData(:,1), rotData(:,i+1), 5);
+                end
+
+                % Plot fitted curves
+                v = -1:0.01:1;
+                cla(app.UIAxesLinearDrag); hold(app.UIAxesLinearDrag, 'on');
+                cla(app.UIAxesRotationalDrag); hold(app.UIAxesRotationalDrag, 'on');
+                coords = {'X', 'Y', 'Z'};
+                cols = {'r', 'g', 'b'};
+                for i = 1:3
+                    % Linear drag
+                    plot(app.UIAxesLinearDrag, linData(:,1), linData(:,i+1), 'o', 'Color', cols{i}, ...
+                         'DisplayName', sprintf('%s Data', coords{i}));
+                    plot(app.UIAxesLinearDrag, v, polyval(app.simParams.polyDragLin(i, :), v), ...
+                         '-', 'Color', cols{i}, 'DisplayName', sprintf('%s Fit', coords{i}));
+                    % Rotational drag
+                    plot(app.UIAxesRotationalDrag, rotData(:,1), rotData(:,i+1), 'o', 'Color', cols{i}, ...
+                         'DisplayName', sprintf('%s Data', coords{i}));
+                    plot(app.UIAxesRotationalDrag, v, polyval(app.simParams.polyDragRot(i, :), v), ...
+                         '-', 'Color', cols{i}, 'DisplayName', sprintf('%s Fit', coords{i}));
+                end
+                title(app.UIAxesLinearDrag, 'Linear Drag Polynomial Fit');
+                xlabel(app.UIAxesLinearDrag, 'Velocity (m/s)'); ylabel(app.UIAxesLinearDrag, 'Force (N)');
+                legend(app.UIAxesLinearDrag, 'show'); grid(app.UIAxesLinearDrag, 'on');
+                hold(app.UIAxesLinearDrag, 'off');
+
+                title(app.UIAxesRotationalDrag, 'Rotational Drag Polynomial Fit');
+                xlabel(app.UIAxesRotationalDrag, 'Angular Velocity (rad/s)'); ylabel(app.UIAxesRotationalDrag, 'Torque (N·m)');
+                legend(app.UIAxesRotationalDrag, 'show'); grid(app.UIAxesRotationalDrag, 'on');
+                hold(app.UIAxesRotationalDrag, 'off');
+
+                uialert(app.UIFigure, 'Polynomial fits completed successfully.', 'Success', 'Icon', 'success');
+            catch ME
+                uialert(app.UIFigure, sprintf('Error fitting polynomials: %s', ME.message), 'Error', 'Icon', 'error');
+            end
+        end
+
         function RunSim(app, ~, ~)
             % Update simParams from GUI inputs
             try
@@ -140,8 +217,6 @@ classdef ROVSimGUI < matlab.apps.AppBase
                 app.simParams.com = app.COMTable.Data';
                 app.simParams.I = diag(app.InertiaTable.Data);
                 app.simParams.added = diag(app.AddedMassTable.Data);
-                app.simParams.CdA = app.CdATable.Data';
-                app.simParams.D_rot = diag(app.DrotTable.Data);
                 app.simParams.r_pos = app.ThrusterConfigTable.Data(:, 1:3);
                 app.simParams.dir_thr = app.ThrusterConfigTable.Data(:, 4:6);
                 app.simParams.Kp = diag(app.GainsTable.Data(:, 1));
@@ -151,6 +226,14 @@ classdef ROVSimGUI < matlab.apps.AppBase
             catch ME
                 uialert(app.UIFigure, sprintf('Invalid input: %s', ME.message), 'Input Error');
                 return;
+            end
+
+            % Check if polynomial drag is defined
+            usePolyDrag = ~isempty(app.simParams.polyDragLin) && ~isempty(app.simParams.polyDragRot);
+            if ~usePolyDrag
+                % Fall back to CdA and D_rot if polynomials not fitted
+                app.simParams.CdA = app.CdATable.Data';
+                app.simParams.D_rot = diag(app.DrotTable.Data);
             end
 
             % Switch to simulation tab
@@ -258,12 +341,27 @@ classdef ROVSimGUI < matlab.apps.AppBase
 
                     % Forces and moments
                     TF = A * thr_a;
-                    F = TF(1:3) - p.CdA .* abs(state(7:9)) .* state(7:9);
-                    M_t = TF(4:6) + cross(p.com, [0; 0; (p.Fb - p.mass * 9.81)]);
+                    if usePolyDrag
+                        % Use polynomial drag
+                        Fdrag = zeros(3, 1);
+                        for i = 1:3
+                            Fdrag(i) = polyval(app.simParams.polyDragLin(i, :), state(6+i));
+                        end
+                        Mdrag = zeros(3, 1);
+                        for i = 1:3
+                            Mdrag(i) = polyval(app.simParams.polyDragRot(i, :), state(9+i));
+                        end
+                        F = TF(1:3) - Fdrag;
+                        M_t = TF(4:6) + cross(p.com, [0; 0; (p.Fb - p.mass * 9.81)]) - Mdrag;
+                    else
+                        % Use coefficient-based drag
+                        F = TF(1:3) - p.CdA .* abs(state(7:9)) .* state(7:9);
+                        M_t = TF(4:6) + cross(p.com, [0; 0; (p.Fb - p.mass * 9.81)]) - p.D_rot * state(10:12);
+                    end
 
                     % Dynamics
                     acc_lin = invM_lin * F;
-                    acc_ang = invM_ang * (M_t - p.D_rot * state(10:12));
+                    acc_ang = invM_ang * M_t;
                     state(7:9) = state(7:9) + acc_lin * p.ts;
                     state(10:12) = state(10:12) + acc_ang * p.ts;
                     state(1:3) = state(1:3) + state(7:9) * p.ts + 0.5 * acc_lin * p.ts^2;
@@ -345,13 +443,12 @@ classdef ROVSimGUI < matlab.apps.AppBase
             resultsStr = sprintf('Simulation Results:\n\n');
 
             % Time to arrival (within 5% of desired pose, ensuring sustained threshold)
-            thresholds = 0.05 * max(abs(app.simParams.desired), 0.1); % Avoid division by zero for small desired values
+            thresholds = 0.05 * max(abs(app.simParams.desired), 0.1); % Avoid division by zero
             arrival_times = zeros(6, 1);
             for i = 1:6
                 err = abs(app.errorHistory(i, :));
-                % Find first index where error stays below threshold for at least 5 timesteps
                 idx = find(err < thresholds(i), 5, 'first');
-                if length(idx) == 5 && all(diff(idx) == 1) && idx(1) > 1 % Ensure consecutive and not at t=0
+                if length(idx) == 5 && all(diff(idx) == 1) && idx(1) > 1
                     arrival_times(i) = app.timeVec(idx(1));
                 else
                     arrival_times(i) = Inf;
@@ -409,11 +506,15 @@ classdef ROVSimGUI < matlab.apps.AppBase
             cla(app.UIAxesHull3D);
             cla(app.UIAxesError);
             cla(app.UIAxesControlEffort);
+            cla(app.UIAxesLinearDrag);
+            cla(app.UIAxesRotationalDrag);
             app.ResultsTextArea.Value = '';
             app.stateHistory = [];
             app.thrustHistory = [];
             app.errorHistory = [];
             app.timeVec = [];
+            app.simParams.polyDragLin = [];
+            app.simParams.polyDragRot = [];
             app.startup();
         end
     end
@@ -437,6 +538,9 @@ classdef ROVSimGUI < matlab.apps.AppBase
             % Create Results Tab
             app.ResultsTab = uitab(app.TabGroup, 'Title', 'Results');
 
+            % Create Drag Fitting Tab
+            app.DragFittingTab = uitab(app.TabGroup, 'Title', 'Drag Fitting');
+
             % Control Buttons (visible on all tabs)
             app.LoadANSYSButton = uibutton(app.UIFigure, 'Text', 'Load ANSYS', 'Position', [20 890 100 30], ...
                                            'ButtonPushedFcn', @(s, e) app.LoadANSYS(s, e));
@@ -444,87 +548,63 @@ classdef ROVSimGUI < matlab.apps.AppBase
                                         'ButtonPushedFcn', @(s, e) app.RunSim(s, e));
             app.ResetButton = uibutton(app.UIFigure, 'Text', 'Reset', 'Position', [280 890 100 30], ...
                                        'ButtonPushedFcn', @(s, e) app.Reset(s, e));
+            app.FitDragButton = uibutton(app.UIFigure, 'Text', 'Fit Drag Polynomials', 'Position', [400 890 150 30], ...
+                                         'ButtonPushedFcn', @(s, e) app.FitDragPolynomials(s, e));
 
             % === PARAMETERS TAB ===
-            % Basic Properties Panel
             app.BasicPropsPanel = uipanel(app.ParametersTab, 'Title', 'Basic Properties', ...
                                           'Position', [20 740 350 100], 'FontWeight', 'bold');
-            
             app.MassLabel = uilabel(app.BasicPropsPanel, 'Text', 'Mass (kg):', ...
                                     'Position', [10 50 80 22], 'FontWeight', 'bold');
             app.MassEdit = uieditfield(app.BasicPropsPanel, 'numeric', 'Position', [100 50 100 22], ...
                                        'Value', 44.05438, 'Limits', [0 Inf]);
-            
             app.VdispLabel = uilabel(app.BasicPropsPanel, 'Text', 'Volume (m³):', ...
                                      'Position', [10 20 80 22], 'FontWeight', 'bold');
             app.VdispEdit = uieditfield(app.BasicPropsPanel, 'numeric', 'Position', [100 20 120 22], ...
                                         'Value', 4.4054e-2, 'Limits', [0 Inf]);
 
-            % Center of Mass Panel
             app.COMPanel = uipanel(app.ParametersTab, 'Title', 'Center of Mass (m)', ...
                                    'Position', [20 640 350 80], 'FontWeight', 'bold');
-            app.COMTable = uitable(app.COMPanel, ...
-                                   'Units', 'normalized', 'Position', [0 0 1 1], ...
-                                   'ColumnName', {'X', 'Y', 'Z'}, 'ColumnEditable', true, ...
-                                   'ColumnWidth', 'auto');
+            app.COMTable = uitable(app.COMPanel, 'Units', 'normalized', 'Position', [0 0 1 1], ...
+                                   'ColumnName', {'X', 'Y', 'Z'}, 'ColumnEditable', true, 'ColumnWidth', 'auto');
 
-            % Inertia Panel
             app.InertiaPanel = uipanel(app.ParametersTab, 'Title', 'Inertia Matrix Diagonal (kg⋅m²)', ...
                                        'Position', [20 540 350 80], 'FontWeight', 'bold');
-            app.InertiaTable = uitable(app.InertiaPanel, ...
-                                       'Units', 'normalized', 'Position', [0 0 1 1], ...
-                                       'ColumnName', {'Ixx', 'Iyy', 'Izz'}, 'ColumnEditable', true, ...
-                                       'ColumnWidth', 'auto');
+            app.InertiaTable = uitable(app.InertiaPanel, 'Units', 'normalized', 'Position', [0 0 1 1], ...
+                                       'ColumnName', {'Ixx', 'Iyy', 'Izz'}, 'ColumnEditable', true, 'ColumnWidth', 'auto');
 
-            % Added Mass Panel
             app.AddedMassPanel = uipanel(app.ParametersTab, 'Title', 'Added Mass Diagonal', ...
                                          'Position', [20 440 350 80], 'FontWeight', 'bold');
-            app.AddedMassTable = uitable(app.AddedMassPanel, ...
-                                         'Units', 'normalized', 'Position', [0 0 1 1], ...
+            app.AddedMassTable = uitable(app.AddedMassPanel, 'Units', 'normalized', 'Position', [0 0 1 1], ...
                                          'ColumnName', {'Am11', 'Am22', 'Am33', 'Am44', 'Am55', 'Am66'}, ...
                                          'ColumnEditable', true, 'ColumnWidth', 'auto');
 
-            % Drag Panel
-            app.DragPanel = uipanel(app.ParametersTab, 'Title', 'Drag Coefficients', ...
+            app.DragPanel = uipanel(app.ParametersTab, 'Title', 'Drag Coefficients (Fallback)', ...
                                     'Position', [20 290 350 130], 'FontWeight', 'bold');
             uilabel(app.DragPanel, 'Text', 'CdA (Linear Drag):', 'Position', [10 85 150 22], 'FontWeight', 'bold');
-
-    app.CdATable = uitable(app.DragPanel, ...
-                           'Units', 'normalized', 'Position', [0 0.5 1 0.5], ...
-                           'ColumnName', {'CdAx', 'CdAy', 'CdAz'}, 'ColumnEditable', true, ...
-                           'ColumnWidth', 'auto');
-
+            app.CdATable = uitable(app.DragPanel, 'Units', 'normalized', 'Position', [0 0.5 1 0.5], ...
+                                   'ColumnName', {'CdAx', 'CdAy', 'CdAz'}, 'ColumnEditable', true, 'ColumnWidth', 'auto');
             uilabel(app.DragPanel, 'Text', 'Rotational Drag:', 'Position', [10 25 150 22], 'FontWeight', 'bold');
-            app.DrotTable = uitable(app.DragPanel, ...
-                                    'Units', 'normalized', 'Position', [0 0 1 0.5], ...
-                                    'ColumnName', {'Dr11', 'Dr22', 'Dr33'}, 'ColumnEditable', true, ...
-                                    'ColumnWidth', 'auto');
+            app.DrotTable = uitable(app.DragPanel, 'Units', 'normalized', 'Position', [0 0 1 0.5], ...
+                                    'ColumnName', {'Dr11', 'Dr22', 'Dr33'}, 'ColumnEditable', true, 'ColumnWidth', 'auto');
 
-            % Thruster Configuration Panel
             app.ThrusterPanel = uipanel(app.ParametersTab, 'Title', 'Thruster Configuration', ...
                                         'Position', [390 440 500 400], 'FontWeight', 'bold');
-            app.ThrusterConfigTable = uitable(app.ThrusterPanel, ...
-                                              'Units', 'normalized', 'Position', [0 0 1 1], ...
+            app.ThrusterConfigTable = uitable(app.ThrusterPanel, 'Units', 'normalized', 'Position', [0 0 1 1], ...
                                               'ColumnName', {'Pos X', 'Pos Y', 'Pos Z', 'Dir X', 'Dir Y', 'Dir Z'}, ...
                                               'RowName', {'T1', 'T2', 'T3', 'T4', 'T5', 'T6', 'T7', 'T8'}, ...
                                               'ColumnEditable', true, 'ColumnWidth', 'auto');
 
-            % Control Gains Panel
             app.ControlPanel = uipanel(app.ParametersTab, 'Title', 'Control Parameters', ...
                                        'Position', [910 440 450 400], 'FontWeight', 'bold');
             uilabel(app.ControlPanel, 'Text', 'PID Gains:', 'Position', [10 350 100 22], 'FontWeight', 'bold');
-            app.GainsTable = uitable(app.ControlPanel, ...
-                                     'Units', 'normalized', 'Position', [0 0.45 1 0.55], ...
-                                     'ColumnName', {'Kp', 'Ki', 'Kd'}, ...
-                                     'RowName', {'X', 'Y', 'Z', 'Roll', 'Pitch', 'Yaw'}, ...
+            app.GainsTable = uitable(app.ControlPanel, 'Units', 'normalized', 'Position', [0 0.45 1 0.55], ...
+                                     'ColumnName', {'Kp', 'Ki', 'Kd'}, 'RowName', {'X', 'Y', 'Z', 'Roll', 'Pitch', 'Yaw'}, ...
                                      'ColumnEditable', true, 'ColumnWidth', 'auto');
-            
             uilabel(app.ControlPanel, 'Text', 'Desired Pose:', 'Position', [10 170 100 22], 'FontWeight', 'bold');
-            app.DesiredPoseTable = uitable(app.ControlPanel, ...
-                                           'Units', 'normalized', 'Position', [0 0 1 0.45], ...
+            app.DesiredPoseTable = uitable(app.ControlPanel, 'Units', 'normalized', 'Position', [0 0 1 0.45], ...
                                            'ColumnName', {'X (m)', 'Y (m)', 'Z (m)', 'Roll (rad)', 'Pitch (rad)', 'Yaw (rad)'}, ...
-                                           'ColumnEditable', true, 'Data', [20, 20, 20, 0, 0, 0], ...
-                                           'ColumnWidth', 'auto');
+                                           'ColumnEditable', true, 'Data', [20, 20, 20, 0, 0, 0], 'ColumnWidth', 'auto');
 
             % === SIMULATION TAB ===
             app.UIAxes2D = uiaxes(app.SimulationTab, 'Position', [50 50 1280 780], 'Box', 'on');
@@ -535,10 +615,8 @@ classdef ROVSimGUI < matlab.apps.AppBase
             % === VISUALIZATION TAB ===
             app.UIAxesThruster3D = uiaxes(app.VisualizationTab, 'Position', [20 450 420 380], 'Box', 'on');
             title(app.UIAxesThruster3D, '3D Thruster Forces');
-            
             app.UIAxesTrajectory3D = uiaxes(app.VisualizationTab, 'Position', [460 450 420 380], 'Box', 'on');
             title(app.UIAxesTrajectory3D, '3D Trajectory');
-            
             app.UIAxesHull3D = uiaxes(app.VisualizationTab, 'Position', [900 450 420 380], 'Box', 'on');
             title(app.UIAxesHull3D, '3D Hull Visualization');
 
@@ -547,14 +625,28 @@ classdef ROVSimGUI < matlab.apps.AppBase
             title(app.UIAxesError, 'Error Over Time');
             xlabel(app.UIAxesError, 'Time (s)');
             ylabel(app.UIAxesError, 'Error');
-
             app.UIAxesControlEffort = uiaxes(app.ResultsTab, 'Position', [680 450 640 380], 'Box', 'on');
             title(app.UIAxesControlEffort, 'Control Effort (Thrust Magnitude)');
             xlabel(app.UIAxesControlEffort, 'Time (s)');
             ylabel(app.UIAxesControlEffort, 'Thrust (N)');
-
             app.ResultsTextArea = uitextarea(app.ResultsTab, 'Position', [20 50 1280 380], ...
                                              'FontSize', 12, 'Editable', 'off');
+
+            % === DRAG FITTING TAB ===
+            app.LinearDragTable = uitable(app.DragFittingTab, 'Position', [20 450 500 380], ...
+                                          'ColumnName', {'Velocity (m/s)', 'X Force (N)', 'Y Force (N)', 'Z Force (N)'}, ...
+                                          'ColumnEditable', true, 'ColumnWidth', 'auto');
+            app.RotationalDragTable = uitable(app.DragFittingTab, 'Position', [540 450 500 380], ...
+                                              'ColumnName', {'Ang. Velocity (rad/s)', 'Roll Torque (N·m)', 'Pitch Torque (N·m)', 'Yaw Torque (N·m)'}, ...
+                                              'ColumnEditable', true, 'ColumnWidth', 'auto');
+            app.UIAxesLinearDrag = uiaxes(app.DragFittingTab, 'Position', [20 50 500 380], 'Box', 'on');
+            title(app.UIAxesLinearDrag, 'Linear Drag Polynomial Fit');
+            xlabel(app.UIAxesLinearDrag, 'Velocity (m/s)');
+            ylabel(app.UIAxesLinearDrag, 'Force (N)');
+            app.UIAxesRotationalDrag = uiaxes(app.DragFittingTab, 'Position', [540 50 500 380], 'Box', 'on');
+            title(app.UIAxesRotationalDrag, 'Rotational Drag Polynomial Fit');
+            xlabel(app.UIAxesRotationalDrag, 'Angular Velocity (rad/s)');
+            ylabel(app.UIAxesRotationalDrag, 'Torque (N·m)');
         end
     end
 
