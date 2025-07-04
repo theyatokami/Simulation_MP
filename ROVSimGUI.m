@@ -1,5 +1,5 @@
 classdef ROVSimGUI < matlab.apps.AppBase
-    % ROVSimGUI: Full-featured GUI for 6-DOF ROV Simulation with ANSYS Integration and Visualizations
+    % ROVSimGUI: GUI for 6-DOF ROV Simulation with CSV drag loading
 
     properties (Access = public)
         UIFigure                 matlab.ui.Figure
@@ -11,7 +11,8 @@ classdef ROVSimGUI < matlab.apps.AppBase
         DragFittingTab           matlab.ui.container.Tab
         
         % Control buttons
-        LoadANSYSButton          matlab.ui.control.Button
+        LoadMATButton            matlab.ui.control.Button
+        LoadDragButton           matlab.ui.control.Button
         RunSimButton             matlab.ui.control.Button
         ResetButton              matlab.ui.control.Button
         FitDragButton            matlab.ui.control.Button
@@ -57,6 +58,8 @@ classdef ROVSimGUI < matlab.apps.AppBase
         ResultsTextArea          matlab.ui.control.TextArea
 
         % Drag Fitting Tab Controls
+        NumPointsLabel           matlab.ui.control.Label
+        NumPointsEdit            matlab.ui.control.NumericEditField
         LinearDragTable          matlab.ui.control.Table
         RotationalDragTable      matlab.ui.control.Table
         UIAxesLinearDrag         matlab.ui.control.UIAxes
@@ -125,22 +128,125 @@ classdef ROVSimGUI < matlab.apps.AppBase
             app.ThrusterConfigTable.Data = [p.r_pos, p.dir_thr];
             app.GainsTable.Data = [diag(p.Kp), diag(p.Ki), diag(p.Kd)];
             app.DesiredPoseTable.Data = p.desired';
-            app.LinearDragTable.Data = [-1:0.2:1; zeros(1,11)]'; % Default velocity range
-            app.RotationalDragTable.Data = [-1:0.2:1; zeros(1,11)]';
+            app.NumPointsEdit.Value = 11; % Default number of points
+            app.updateDragTables();
         end
 
-        function LoadANSYS(app, ~, ~)
-            % Load parameters from ANSYS .mat
-            [file, path] = uigetfile('*.mat', 'Select ANSYS Results File');
-            if isequal(file, 0), return; end
-            data = load(fullfile(path, file));
-            fn = fieldnames(data);
-            for k = 1:length(fn)
-                if isfield(app.simParams, fn{k})
-                    app.simParams.(fn{k}) = data.(fn{k});
+        function updateDragTables(app)
+            % Update drag tables based on number of points
+            try
+                numPoints = round(app.NumPointsEdit.Value);
+                if numPoints < 6
+                    uialert(app.UIFigure, 'Number of points must be at least 6 for quintic fit.', 'Input Error');
+                    app.NumPointsEdit.Value = 6;
+                    numPoints = 6;
                 end
+                v = linspace(-1, 1, numPoints)'; % Default range, editable by user
+                app.LinearDragTable.Data = [v, zeros(numPoints, 3)];
+                app.RotationalDragTable.Data = [v, zeros(numPoints, 3)];
+            catch ME
+                uialert(app.UIFigure, sprintf('Error updating drag tables: %s', ME.message), 'Error', 'Icon', 'error');
             end
-            app.startup();
+        end
+
+        function LoadMAT(app, ~, ~)
+            % Load parameters from .mat file
+            [file, path] = uigetfile('*.mat', 'Select MAT File');
+            if isequal(file, 0), return; end
+            fullPath = fullfile(path, file);
+            try
+                data = load(fullPath);
+                fn = fieldnames(data);
+                p = app.simParams; % Start with current parameters
+                for k = 1:length(fn)
+                    if isfield(p, fn{k})
+                        p.(fn{k}) = data.(fn{k});
+                    end
+                end
+                app.simParams = p;
+
+                % Update UI with loaded parameters
+                app.MassEdit.Value = p.mass;
+                app.VdispEdit.Value = p.Vdisp;
+                app.COMTable.Data = p.com';
+                app.InertiaTable.Data = diag(p.I)';
+                app.AddedMassTable.Data = diag(p.added)';
+                app.CdATable.Data = p.CdA';
+                app.DrotTable.Data = diag(p.D_rot)';
+                app.ThrusterConfigTable.Data = [p.r_pos, p.dir_thr];
+                app.GainsTable.Data = [diag(p.Kp), diag(p.Ki), diag(p.Kd)];
+                app.DesiredPoseTable.Data = p.desired';
+                uialert(app.UIFigure, sprintf('Parameters loaded from %s.', fullPath), 'Success', 'Icon', 'success');
+            catch ME
+                uialert(app.UIFigure, sprintf('Error loading MAT file: %s', ME.message), 'Error', 'Icon', 'error');
+            end
+        end
+
+        function LoadDragFromCSV(app, ~, ~)
+            % Load drag data from CSV file
+            [file, path] = uigetfile('*.csv', 'Select Drag Data CSV File', 'drag_data.csv');
+            if isequal(file, 0), return; end
+            fullPath = fullfile(path, file);
+            try
+                % Read the entire file as text
+                fid = fopen(fullPath, 'r');
+                if fid == -1
+                    uialert(app.UIFigure, 'Cannot open CSV file.', 'File Error');
+                    return;
+                end
+                lines = textscan(fid, '%s', 'Delimiter', '\n', 'Whitespace', '');
+                fclose(fid);
+                lines = lines{1};
+
+                % Initialize data storage
+                linearData = [];
+                rotationalData = [];
+                section = '';
+
+                % Parse lines
+                for i = 1:length(lines)
+                    line = strtrim(lines{i});
+                    if isempty(line) || strcmp(line, ','), continue; end % Skip empty or comma-only lines
+
+                    if strcmpi(line, 'Linear')
+                        section = 'Linear';
+                    elseif strcmpi(line, 'Rotational')
+                        section = 'Rotational';
+                    elseif ~isempty(section) && ~strcmp(line(1), '%') % Skip comments
+                        % Split by comma and convert to numbers
+                        data = str2double(regexp(line, '[^,]+', 'match'));
+                        if length(data) == 4 && all(~isnan(data)) % Ensure 4 valid columns
+                            if strcmp(section, 'Linear')
+                                linearData = [linearData; data];
+                            elseif strcmp(section, 'Rotational')
+                                rotationalData = [rotationalData; data];
+                            end
+                        end
+                    end
+                end
+
+                % Validate data
+                if isempty(linearData) || isempty(rotationalData)
+                    uialert(app.UIFigure, 'CSV file must contain both Linear and Rotational sections with data.', 'File Error');
+                    return;
+                end
+                if size(linearData, 2) ~= 4 || size(rotationalData, 2) ~= 4
+                    uialert(app.UIFigure, 'Each section must have 4 columns (A, B, C, D).', 'File Error');
+                    return;
+                end
+                if size(linearData, 1) < 6 || size(rotationalData, 1) < 6
+                    uialert(app.UIFigure, 'Each section must contain at least 6 data points.', 'Input Error');
+                    return;
+                end
+
+                % Update tables
+                app.NumPointsEdit.Value = max(size(linearData, 1), size(rotationalData, 1));
+                app.LinearDragTable.Data = linearData;
+                app.RotationalDragTable.Data = rotationalData;
+                uialert(app.UIFigure, sprintf('Drag data loaded from %s.', fullPath), 'Success', 'Icon', 'success');
+            catch ME
+                uialert(app.UIFigure, sprintf('Error loading drag data: %s', ME.message), 'Error', 'Icon', 'error');
+            end
         end
 
         function FitDragPolynomials(app, ~, ~)
@@ -158,54 +264,40 @@ classdef ROVSimGUI < matlab.apps.AppBase
                     uialert(app.UIFigure, 'Drag tables contain invalid (NaN) values.', 'Input Error');
                     return;
                 end
-                if any(abs(linData(:,1)) > 1) || any(abs(rotData(:,1)) > 1)
-                    uialert(app.UIFigure, 'Velocities must be within [-1, 1] m/s or rad/s.', 'Input Error');
-                    return;
-                end
-                if size(linData, 1) < 6 || size(rotData, 1) < 6
-                    uialert(app.UIFigure, 'At least 6 data points are required for quintic polynomial fit.', 'Input Error');
-                    return;
+
+                % Fit polynomials (quintic for 6 coefficients)
+                v = linData(:, 1);
+                pLin = zeros(3, 6); % 3 axes, 6 coefficients each
+                pRot = zeros(3, 6); % 3 axes, 6 coefficients each
+                for i = 1:3
+                    pLin(i, :) = polyfit(v, linData(:, i+1), 5);
+                    pRot(i, :) = polyfit(v, rotData(:, i+1), 5);
                 end
 
-                % Fit quintic polynomials
-                app.simParams.polyDragLin = zeros(3, 6);
-                app.simParams.polyDragRot = zeros(3, 6);
-                for i = 1:3
-                    app.simParams.polyDragLin(i, :) = polyfit(linData(:,1), linData(:,i+1), 5);
-                    app.simParams.polyDragRot(i, :) = polyfit(rotData(:,1), rotData(:,i+1), 5);
-                end
+                % Store in simParams
+                app.simParams.polyDragLin = pLin;
+                app.simParams.polyDragRot = pRot;
 
-                % Plot fitted curves
-                v = -1:0.01:1;
-                cla(app.UIAxesLinearDrag); hold(app.UIAxesLinearDrag, 'on');
-                cla(app.UIAxesRotationalDrag); hold(app.UIAxesRotationalDrag, 'on');
-                coords = {'X', 'Y', 'Z'};
-                cols = {'r', 'g', 'b'};
+                % Update plots
+                cla(app.UIAxesLinearDrag);
+                cla(app.UIAxesRotationalDrag);
+                hold(app.UIAxesLinearDrag, 'on');
+                hold(app.UIAxesRotationalDrag, 'on');
+                vFit = linspace(min(v), max(v), 100)';
                 for i = 1:3
-                    % Linear drag
-                    plot(app.UIAxesLinearDrag, linData(:,1), linData(:,i+1), 'o', 'Color', cols{i}, ...
-                         'DisplayName', sprintf('%s Data', coords{i}));
-                    plot(app.UIAxesLinearDrag, v, polyval(app.simParams.polyDragLin(i, :), v), ...
-                         '-', 'Color', cols{i}, 'DisplayName', sprintf('%s Fit', coords{i}));
-                    % Rotational drag
-                    plot(app.UIAxesRotationalDrag, rotData(:,1), rotData(:,i+1), 'o', 'Color', cols{i}, ...
-                         'DisplayName', sprintf('%s Data', coords{i}));
-                    plot(app.UIAxesRotationalDrag, v, polyval(app.simParams.polyDragRot(i, :), v), ...
-                         '-', 'Color', cols{i}, 'DisplayName', sprintf('%s Fit', coords{i}));
+                    plot(app.UIAxesLinearDrag, vFit, polyval(pLin(i, :), vFit), 'DisplayName', sprintf('Axis %d', i));
+                    plot(app.UIAxesRotationalDrag, vFit, polyval(pRot(i, :), vFit), 'DisplayName', sprintf('Axis %d', i));
                 end
-                title(app.UIAxesLinearDrag, 'Linear Drag Polynomial Fit');
-                xlabel(app.UIAxesLinearDrag, 'Velocity (m/s)'); ylabel(app.UIAxesLinearDrag, 'Force (N)');
-                legend(app.UIAxesLinearDrag, 'show'); grid(app.UIAxesLinearDrag, 'on');
+                title(app.UIAxesLinearDrag, 'Linear Drag Fit');
+                title(app.UIAxesRotationalDrag, 'Rotational Drag Fit');
+                legend(app.UIAxesLinearDrag, 'show');
+                legend(app.UIAxesRotationalDrag, 'show');
                 hold(app.UIAxesLinearDrag, 'off');
-
-                title(app.UIAxesRotationalDrag, 'Rotational Drag Polynomial Fit');
-                xlabel(app.UIAxesRotationalDrag, 'Angular Velocity (rad/s)'); ylabel(app.UIAxesRotationalDrag, 'Torque (N·m)');
-                legend(app.UIAxesRotationalDrag, 'show'); grid(app.UIAxesRotationalDrag, 'on');
                 hold(app.UIAxesRotationalDrag, 'off');
 
-                uialert(app.UIFigure, 'Polynomial fits completed successfully.', 'Success', 'Icon', 'success');
+                uialert(app.UIFigure, 'Drag polynomials fitted successfully.', 'Success', 'Icon', 'success');
             catch ME
-                uialert(app.UIFigure, sprintf('Error fitting polynomials: %s', ME.message), 'Error', 'Icon', 'error');
+                uialert(app.UIFigure, sprintf('Error fitting drag polynomials: %s', ME.message), 'Error', 'Icon', 'error');
             end
         end
 
@@ -226,14 +318,6 @@ classdef ROVSimGUI < matlab.apps.AppBase
             catch ME
                 uialert(app.UIFigure, sprintf('Invalid input: %s', ME.message), 'Input Error');
                 return;
-            end
-
-            % Check if polynomial drag is defined
-            usePolyDrag = ~isempty(app.simParams.polyDragLin) && ~isempty(app.simParams.polyDragRot);
-            if ~usePolyDrag
-                % Fall back to CdA and D_rot if polynomials not fitted
-                app.simParams.CdA = app.CdATable.Data';
-                app.simParams.D_rot = diag(app.DrotTable.Data);
             end
 
             % Switch to simulation tab
@@ -311,7 +395,7 @@ classdef ROVSimGUI < matlab.apps.AppBase
             prevErr = p.desired; % Initialize with initial error
             thr_e = zeros(8, 1);
             thr_a = zeros(8, 1);
-            Tmax = 60;
+            Tmax = 40;
             tau_e = 0.05;
             tau_m = 0.15;
             alpha_e = p.ts / (tau_e + p.ts);
@@ -339,25 +423,28 @@ classdef ROVSimGUI < matlab.apps.AppBase
                     thr_e = alpha_e * tc + (1 - alpha_e) * thr_e;
                     thr_a = alpha_m * thr_e + (1 - alpha_m) * thr_a;
 
-                    % Forces and moments
-                    TF = A * thr_a;
-                    if usePolyDrag
-                        % Use polynomial drag
-                        Fdrag = zeros(3, 1);
+                    % Forces and moments (using polynomial drag if available)
+                    vLin = state(7:9);
+                    vRot = state(10:12);
+                    if ~isempty(p.polyDragLin)
+                        F = zeros(3, 1);
                         for i = 1:3
-                            Fdrag(i) = polyval(app.simParams.polyDragLin(i, :), state(6+i));
+                            F(i) = polyval(p.polyDragLin(i, :), vLin(i));
                         end
-                        Mdrag = zeros(3, 1);
-                        for i = 1:3
-                            Mdrag(i) = polyval(app.simParams.polyDragRot(i, :), state(9+i));
-                        end
-                        F = TF(1:3) - Fdrag;
-                        M_t = TF(4:6) + cross(p.com, [0; 0; (p.Fb - p.mass * 9.81)]) - Mdrag;
                     else
-                        % Use coefficient-based drag
-                        F = TF(1:3) - p.CdA .* abs(state(7:9)) .* state(7:9);
-                        M_t = TF(4:6) + cross(p.com, [0; 0; (p.Fb - p.mass * 9.81)]) - p.D_rot * state(10:12);
+                        F = -p.CdA .* abs(vLin) .* vLin; % Fallback to quadratic drag
                     end
+                    if ~isempty(p.polyDragRot)
+                        M_t = zeros(3, 1);
+                        for i = 1:3
+                            M_t(i) = polyval(p.polyDragRot(i, :), vRot(i));
+                        end
+                    else
+                        M_t = -p.D_rot * vRot; % Fallback to linear rotational drag
+                    end
+                    TF = A * thr_a;
+                    F = F + TF(1:3);
+                    M_t = M_t + TF(4:6) + cross(p.com, [0; 0; (p.Fb - p.mass * 9.81)]);
 
                     % Dynamics
                     acc_lin = invM_lin * F;
@@ -506,15 +593,11 @@ classdef ROVSimGUI < matlab.apps.AppBase
             cla(app.UIAxesHull3D);
             cla(app.UIAxesError);
             cla(app.UIAxesControlEffort);
-            cla(app.UIAxesLinearDrag);
-            cla(app.UIAxesRotationalDrag);
             app.ResultsTextArea.Value = '';
             app.stateHistory = [];
             app.thrustHistory = [];
             app.errorHistory = [];
             app.timeVec = [];
-            app.simParams.polyDragLin = [];
-            app.simParams.polyDragRot = [];
             app.startup();
         end
     end
@@ -537,18 +620,20 @@ classdef ROVSimGUI < matlab.apps.AppBase
             
             % Create Results Tab
             app.ResultsTab = uitab(app.TabGroup, 'Title', 'Results');
-
+            
             % Create Drag Fitting Tab
             app.DragFittingTab = uitab(app.TabGroup, 'Title', 'Drag Fitting');
 
-            % Control Buttons (visible on all tabs)
-            app.LoadANSYSButton = uibutton(app.UIFigure, 'Text', 'Load ANSYS', 'Position', [20 890 100 30], ...
-                                           'ButtonPushedFcn', @(s, e) app.LoadANSYS(s, e));
-            app.RunSimButton = uibutton(app.UIFigure, 'Text', 'Run Simulation', 'Position', [140 890 120 30], ...
+            % Control Buttons
+            app.LoadMATButton = uibutton(app.UIFigure, 'Text', 'Load MAT', 'Position', [20 890 100 30], ...
+                                         'ButtonPushedFcn', @(s, e) app.LoadMAT(s, e));
+            app.LoadDragButton = uibutton(app.UIFigure, 'Text', 'Load Drag CSV', 'Position', [140 890 120 30], ...
+                                          'ButtonPushedFcn', @(s, e) app.LoadDragFromCSV(s, e));
+            app.RunSimButton = uibutton(app.UIFigure, 'Text', 'Run Simulation', 'Position', [280 890 120 30], ...
                                         'ButtonPushedFcn', @(s, e) app.RunSim(s, e));
-            app.ResetButton = uibutton(app.UIFigure, 'Text', 'Reset', 'Position', [280 890 100 30], ...
+            app.ResetButton = uibutton(app.UIFigure, 'Text', 'Reset', 'Position', [420 890 100 30], ...
                                        'ButtonPushedFcn', @(s, e) app.Reset(s, e));
-            app.FitDragButton = uibutton(app.UIFigure, 'Text', 'Fit Drag Polynomials', 'Position', [400 890 150 30], ...
+            app.FitDragButton = uibutton(app.UIFigure, 'Text', 'Fit Drag Polynomials', 'Position', [540 890 150 30], ...
                                          'ButtonPushedFcn', @(s, e) app.FitDragPolynomials(s, e));
 
             % === PARAMETERS TAB ===
@@ -568,7 +653,7 @@ classdef ROVSimGUI < matlab.apps.AppBase
             app.COMTable = uitable(app.COMPanel, 'Units', 'normalized', 'Position', [0 0 1 1], ...
                                    'ColumnName', {'X', 'Y', 'Z'}, 'ColumnEditable', true, 'ColumnWidth', 'auto');
 
-            app.InertiaPanel = uipanel(app.ParametersTab, 'Title', 'Inertia Matrix Diagonal (kg⋅m²)', ...
+            app.InertiaPanel = uipanel(app.ParametersTab, 'Title', 'Inertia Matrix Diagonal (kg m²)', ...
                                        'Position', [20 540 350 80], 'FontWeight', 'bold');
             app.InertiaTable = uitable(app.InertiaPanel, 'Units', 'normalized', 'Position', [0 0 1 1], ...
                                        'ColumnName', {'Ixx', 'Iyy', 'Izz'}, 'ColumnEditable', true, 'ColumnWidth', 'auto');
@@ -579,7 +664,7 @@ classdef ROVSimGUI < matlab.apps.AppBase
                                          'ColumnName', {'Am11', 'Am22', 'Am33', 'Am44', 'Am55', 'Am66'}, ...
                                          'ColumnEditable', true, 'ColumnWidth', 'auto');
 
-            app.DragPanel = uipanel(app.ParametersTab, 'Title', 'Drag Coefficients (Fallback)', ...
+            app.DragPanel = uipanel(app.ParametersTab, 'Title', 'Drag Coefficients', ...
                                     'Position', [20 290 350 130], 'FontWeight', 'bold');
             uilabel(app.DragPanel, 'Text', 'CdA (Linear Drag):', 'Position', [10 85 150 22], 'FontWeight', 'bold');
             app.CdATable = uitable(app.DragPanel, 'Units', 'normalized', 'Position', [0 0.5 1 0.5], ...
@@ -633,20 +718,20 @@ classdef ROVSimGUI < matlab.apps.AppBase
                                              'FontSize', 12, 'Editable', 'off');
 
             % === DRAG FITTING TAB ===
-            app.LinearDragTable = uitable(app.DragFittingTab, 'Position', [20 450 500 380], ...
-                                          'ColumnName', {'Velocity (m/s)', 'X Force (N)', 'Y Force (N)', 'Z Force (N)'}, ...
+            app.NumPointsLabel = uilabel(app.DragFittingTab, 'Text', 'Number of Points:', ...
+                                         'Position', [20 830 120 22], 'FontWeight', 'bold');
+            app.NumPointsEdit = uieditfield(app.DragFittingTab, 'numeric', 'Position', [150 830 100 22], ...
+                                            'Value', 11, 'Limits', [6 Inf], 'ValueChangedFcn', @(s, e) app.updateDragTables());
+            app.LinearDragTable = uitable(app.DragFittingTab, 'Position', [20 600 600 200], ...
+                                          'ColumnName', {'A', 'B', 'C', 'D'}, ...
                                           'ColumnEditable', true, 'ColumnWidth', 'auto');
-            app.RotationalDragTable = uitable(app.DragFittingTab, 'Position', [540 450 500 380], ...
-                                              'ColumnName', {'Ang. Velocity (rad/s)', 'Roll Torque (N·m)', 'Pitch Torque (N·m)', 'Yaw Torque (N·m)'}, ...
+            app.RotationalDragTable = uitable(app.DragFittingTab, 'Position', [650 600 600 200], ...
+                                              'ColumnName', {'A', 'B', 'C', 'D'}, ...
                                               'ColumnEditable', true, 'ColumnWidth', 'auto');
-            app.UIAxesLinearDrag = uiaxes(app.DragFittingTab, 'Position', [20 50 500 380], 'Box', 'on');
-            title(app.UIAxesLinearDrag, 'Linear Drag Polynomial Fit');
-            xlabel(app.UIAxesLinearDrag, 'Velocity (m/s)');
-            ylabel(app.UIAxesLinearDrag, 'Force (N)');
-            app.UIAxesRotationalDrag = uiaxes(app.DragFittingTab, 'Position', [540 50 500 380], 'Box', 'on');
-            title(app.UIAxesRotationalDrag, 'Rotational Drag Polynomial Fit');
-            xlabel(app.UIAxesRotationalDrag, 'Angular Velocity (rad/s)');
-            ylabel(app.UIAxesRotationalDrag, 'Torque (N·m)');
+            app.UIAxesLinearDrag = uiaxes(app.DragFittingTab, 'Position', [20 350 600 200], 'Box', 'on');
+            title(app.UIAxesLinearDrag, 'Linear Drag Fit');
+            app.UIAxesRotationalDrag = uiaxes(app.DragFittingTab, 'Position', [650 350 600 200], 'Box', 'on');
+            title(app.UIAxesRotationalDrag, 'Rotational Drag Fit');
         end
     end
 
