@@ -18,6 +18,8 @@ classdef ROVSimGUI < matlab.apps.AppBase
         RunSimButton             matlab.ui.control.Button
         ResetButton              matlab.ui.control.Button
         FitDragButton            matlab.ui.control.Button
+        ForceLoadMatButton       matlab.ui.control.Button
+        ResetDefaultsButton      matlab.ui.control.Button
         
         % Parameters Tab Controls
         BasicPropsPanel          matlab.ui.container.Panel
@@ -109,11 +111,30 @@ classdef ROVSimGUI < matlab.apps.AppBase
             end
 
             % Load parameters from .mat or use defaults
+            app.forceLoadParameters();
+        end
+
+        % --- Force Load Parameters from .mat ---
+        function forceLoadParameters(app)
+            % Force reload parameters from .mat file
             if isfile(app.matFile)
                 try
                     load(app.matFile, 'simParams');
-                    app.simParams = simParams;
-                    disp('Parameters loaded successfully from .mat file.');
+                    % Define required fields
+                    requiredFields = {'mass', 'Vdisp', 'maxThrust', 'com', 'I', 'added', ...
+                                      'CdA', 'D_rot', 'r_pos', 'dir_thr', 'Kp', 'Ki', 'Kd', ...
+                                      'Kv_p', 'Kv_i', 'Kv_d', 'desired', 'polyDragLin', 'polyDragRot', ...
+                                      'ts', 't_final', 'Fb'};
+                    % Check if all required fields exist
+                    missingFields = requiredFields(~isfield(simParams, requiredFields));
+                    if isempty(missingFields)
+                        app.simParams = simParams;
+                        disp('Parameters loaded successfully from .mat file.');
+                    else
+                        warning('Missing fields in .mat file: %s. Initializing defaults.', strjoin(missingFields, ', '));
+                        app.initializeDefaultParameters();
+                        save(app.matFile, 'simParams');
+                    end
                 catch ME
                     uialert(app.UIFigure, sprintf('Error loading .mat: %s. Initializing defaults.', ME.message), 'Error', 'Icon', 'error');
                     app.initializeDefaultParameters();
@@ -124,23 +145,27 @@ classdef ROVSimGUI < matlab.apps.AppBase
                 save(app.matFile, 'simParams');
             end
 
-            % Populate UI components
-            app.MassEdit.Value = app.simParams.mass;
-            app.VdispEdit.Value = app.simParams.Vdisp;
-            app.MaxThrustEdit.Value = app.simParams.maxThrust;
-            app.COMTable.Data = app.simParams.com';
-            app.InertiaTable.Data = diag(app.simParams.I)';
-            app.AddedMassTable.Data = diag(app.simParams.added)';
-            app.CdATable.Data = app.simParams.CdA';
-            app.DrotTable.Data = diag(app.simParams.D_rot)';
-            app.ThrusterConfigTable.Data = [app.simParams.r_pos, app.simParams.dir_thr];
-            app.GainsTable.Data = [diag(app.simParams.Kp), diag(app.simParams.Ki), diag(app.simParams.Kd)];
-            app.VelocityGainsTable.Data = [diag(app.simParams.Kv_p), diag(app.simParams.Kv_i), diag(app.simParams.Kv_d)];
-            app.DesiredPoseTable.Data = app.simParams.desired';
-            app.NumPointsEdit.Value = 11;
-            app.updateDragTables();
-            app.TuningGoalDropDown.Items = {'Optimized Tuning'};
-            app.TuningGoalDropDown.Value = 'Optimized Tuning';
+            % Populate UI components with defaults if not already set
+            try
+                app.MassEdit.Value = app.simParams.mass;
+                app.VdispEdit.Value = app.simParams.Vdisp;
+                app.MaxThrustEdit.Value = app.simParams.maxThrust;
+                app.COMTable.Data = app.simParams.com';
+                app.InertiaTable.Data = diag(app.simParams.I)';
+                app.AddedMassTable.Data = diag(app.simParams.added)';
+                app.CdATable.Data = app.simParams.CdA';
+                app.DrotTable.Data = diag(app.simParams.D_rot)';
+                app.ThrusterConfigTable.Data = [app.simParams.r_pos, app.simParams.dir_thr];
+                app.GainsTable.Data = [diag(app.simParams.Kp), diag(app.simParams.Ki), diag(app.simParams.Kd)];
+                app.VelocityGainsTable.Data = [diag(app.simParams.Kv_p), diag(app.simParams.Kv_i), diag(app.simParams.Kv_d)];
+                app.DesiredPoseTable.Data = app.simParams.desired';
+                app.NumPointsEdit.Value = 11;
+                app.updateDragTables();
+                app.TuningGoalDropDown.Items = {'Optimized Tuning'};
+                app.TuningGoalDropDown.Value = 'Optimized Tuning';
+            catch ME
+                uialert(app.UIFigure, sprintf('Error populating UI: %s', ME.message), 'Error', 'Icon', 'error');
+            end
         end
 
         % --- Parameter Initialization ---
@@ -183,6 +208,19 @@ classdef ROVSimGUI < matlab.apps.AppBase
                 disp(['Parameters saved successfully to: ', app.matFile]);
             catch ME
                 uialert(app.UIFigure, sprintf('Failed to save .mat: %s', ME.message), 'Error', 'Icon', 'error');
+            end
+        end
+
+        % --- Reset to Default Parameters ---
+        function resetToDefaults(app, ~, ~)
+            % Reset parameters to defaults and update UI
+            try
+                app.initializeDefaultParameters();
+                app.saveParametersToMat();
+                app.forceLoadParameters(); % Update UI with default values
+                uialert(app.UIFigure, 'Parameters reset to defaults successfully.', 'Success', 'Icon', 'success');
+            catch ME
+                uialert(app.UIFigure, sprintf('Error resetting parameters: %s', ME.message), 'Error', 'Icon', 'error');
             end
         end
 
@@ -376,8 +414,8 @@ classdef ROVSimGUI < matlab.apps.AppBase
             p.Kv_i = diag(x(25:30));
             p.Kv_d = diag(x(31:36));
         
-            % Longer simulation to evaluate steady-state (increased duration)
-            N = round(p.t_final / p.ts); % Use full duration for better settling
+            % Longer simulation to evaluate steady-state
+            N = round(p.t_final / p.ts);
             timeVec = (0:N-1) * p.ts;
             stateHistory = zeros(12, N);
             errorHistory = zeros(6, N);
@@ -734,6 +772,7 @@ classdef ROVSimGUI < matlab.apps.AppBase
             resultsStr = sprintf('Simulation Results:\n\n');
             thresholds = 0.05 * max(abs(app.simParams.desired), 0.1);
             arrival_times = zeros(6, 1);
+            final_err = app.errorHistory(:, end);
             for i = 1:6
                 err = abs(app.errorHistory(i, :));
                 idx = find(err < thresholds(i), 5, 'first');
@@ -751,8 +790,6 @@ classdef ROVSimGUI < matlab.apps.AppBase
                     resultsStr = [resultsStr, sprintf('  %s: %.2f s\n', coords{i}, arrival_times(i))];
                 end
             end
-
-            final_err = app.errorHistory(:, end);
             resultsStr = [resultsStr, sprintf('\nFinal Steady-State Error:\n')];
             for i = 1:6
                 resultsStr = [resultsStr, sprintf('  %s: %.4f\n', coords{i}, final_err(i))];
@@ -841,10 +878,13 @@ classdef ROVSimGUI < matlab.apps.AppBase
     % --- GUI Creation ---
     methods (Access = private)
         function createComponents(app)
+            % Create figure with fixed size
             app.UIFigure = uifigure('Name', 'ROV Simulation Platform', 'Position', [100 100 1400 900]);
 
-            app.TabGroup = uitabgroup(app.UIFigure, 'Position', [10 10 1380 880]);
+            % TabGroup with adjusted size to accommodate buttons at top
+            app.TabGroup = uitabgroup(app.UIFigure, 'Position', [10 50 1380 800]);
             
+            % Create tabs
             app.ParametersTab = uitab(app.TabGroup, 'Title', 'Parameters');
             app.SimulationTab = uitab(app.TabGroup, 'Title', 'Simulation');
             app.VisualizationTab = uitab(app.TabGroup, 'Title', '3D Visualization');
@@ -852,17 +892,23 @@ classdef ROVSimGUI < matlab.apps.AppBase
             app.DragFittingTab = uitab(app.TabGroup, 'Title', 'Drag Fitting');
             app.PIDTuningTab = uitab(app.TabGroup, 'Title', 'PID Tuning');
 
-            app.LoadDragButton = uibutton(app.UIFigure, 'Text', 'Load Drag CSV', 'Position', [20 890 120 30], ...
+            % Buttons positioned at top, above TabGroup
+            app.LoadDragButton = uibutton(app.UIFigure, 'Text', 'Load Drag CSV', 'Position', [20 850 120 25], ...
                                           'ButtonPushedFcn', @(s, e) app.LoadDragFromCSV(s, e));
-            app.RunSimButton = uibutton(app.UIFigure, 'Text', 'Run Simulation', 'Position', [160 890 120 30], ...
+            app.RunSimButton = uibutton(app.UIFigure, 'Text', 'Run Simulation', 'Position', [150 850 120 25], ...
                                         'ButtonPushedFcn', @(s, e) app.RunSim(s, e));
-            app.ResetButton = uibutton(app.UIFigure, 'Text', 'Reset', 'Position', [300 890 100 30], ...
+            app.ResetButton = uibutton(app.UIFigure, 'Text', 'Reset', 'Position', [280 850 120 25], ...
                                        'ButtonPushedFcn', @(s, e) app.Reset(s, e));
-            app.FitDragButton = uibutton(app.UIFigure, 'Text', 'Fit Drag Polynomials', 'Position', [420 890 150 30], ...
+            app.FitDragButton = uibutton(app.UIFigure, 'Text', 'Fit Drag Polynomials', 'Position', [410 850 120 25], ...
                                          'ButtonPushedFcn', @(s, e) app.FitDragPolynomials(s, e));
+            app.ForceLoadMatButton = uibutton(app.UIFigure, 'Text', 'Force Load .mat', 'Position', [540 850 120 25], ...
+                                              'ButtonPushedFcn', @(s, e) app.forceLoadParameters());
+            app.ResetDefaultsButton = uibutton(app.UIFigure, 'Text', 'Reset to Defaults', 'Position', [670 850 120 25], ...
+                                               'ButtonPushedFcn', @(s, e) app.resetToDefaults());
 
+            % Parameters Tab Components (scaled to fit TabGroup height of 800)
             app.BasicPropsPanel = uipanel(app.ParametersTab, 'Title', 'Basic Properties', ...
-                                          'Position', [20 710 350 120], 'FontWeight', 'bold');
+                                          'Position', [20 650 350 120], 'FontWeight', 'bold');
             app.MassLabel = uilabel(app.BasicPropsPanel, 'Text', 'Mass (kg):', ...
                                     'Position', [10 80 80 22], 'FontWeight', 'bold');
             app.MassEdit = uieditfield(app.BasicPropsPanel, 'numeric', 'Position', [100 80 100 22], ...
@@ -880,21 +926,21 @@ classdef ROVSimGUI < matlab.apps.AppBase
                                             'ValueChangedFcn', @(s, e) app.updateParameter('maxThrust', s.Value, 'MaxThrustEdit'));
 
             app.COMPanel = uipanel(app.ParametersTab, 'Title', 'Center of Mass (m)', ...
-                                   'Position', [20 560 350 100], 'FontWeight', 'bold');
+                                   'Position', [20 510 350 100], 'FontWeight', 'bold');
             app.COMTable = uitable(app.COMPanel, 'Units', 'normalized', 'Position', [0 0 1 1], ...
                                    'ColumnName', {'X', 'Y', 'Z'}, 'ColumnEditable', true, 'ColumnWidth', 'auto', ...
                                    'Data', [0 0 0], ...
                                    'CellEditCallback', @(s, e) app.updateParameter('com', s.Data, 'COMTable'));
 
             app.InertiaPanel = uipanel(app.ParametersTab, 'Title', 'Inertia Matrix Diagonal (kg m²)', ...
-                                       'Position', [20 430 350 100], 'FontWeight', 'bold');
+                                       'Position', [20 380 350 100], 'FontWeight', 'bold');
             app.InertiaTable = uitable(app.InertiaPanel, 'Units', 'normalized', 'Position', [0 0 1 1], ...
                                        'ColumnName', {'Ixx', 'Iyy', 'Izz'}, 'ColumnEditable', true, 'ColumnWidth', 'auto', ...
                                        'Data', [0 0 0], ...
                                        'CellEditCallback', @(s, e) app.updateParameter('I', s.Data, 'InertiaTable'));
 
             app.AddedMassPanel = uipanel(app.ParametersTab, 'Title', 'Added Mass Diagonal', ...
-                                         'Position', [20 300 350 100], 'FontWeight', 'bold');
+                                         'Position', [20 250 350 100], 'FontWeight', 'bold');
             app.AddedMassTable = uitable(app.AddedMassPanel, 'Units', 'normalized', 'Position', [0 0 1 1], ...
                                          'ColumnName', {'Am11', 'Am22', 'Am33', 'Am44', 'Am55', 'Am66'}, ...
                                          'ColumnEditable', true, 'ColumnWidth', 'auto', ...
@@ -902,7 +948,7 @@ classdef ROVSimGUI < matlab.apps.AppBase
                                          'CellEditCallback', @(s, e) app.updateParameter('added', s.Data, 'AddedMassTable'));
 
             app.DragPanel = uipanel(app.ParametersTab, 'Title', 'Drag Coefficients', ...
-                                    'Position', [20 110 350 170], 'FontWeight', 'bold');
+                                    'Position', [20 60 350 170], 'FontWeight', 'bold');
             uilabel(app.DragPanel, 'Text', 'CdA (Linear Drag):', 'Position', [10 120 150 22], 'FontWeight', 'bold');
             app.CdATable = uitable(app.DragPanel, 'Units', 'normalized', 'Position', [0 0.5 1 0.5], ...
                                    'ColumnName', {'CdAx', 'CdAy', 'CdAz'}, 'ColumnEditable', true, 'ColumnWidth', 'auto', ...
@@ -915,7 +961,7 @@ classdef ROVSimGUI < matlab.apps.AppBase
                                     'CellEditCallback', @(s, e) app.updateParameter('D_rot', s.Data, 'DrotTable'));
 
             app.ThrusterPanel = uipanel(app.ParametersTab, 'Title', 'Thruster Configuration', ...
-                                        'Position', [390 110 500 400], 'FontWeight', 'bold');
+                                        'Position', [390 60 500 350], 'FontWeight', 'bold');
             app.ThrusterConfigTable = uitable(app.ThrusterPanel, 'Units', 'normalized', 'Position', [0 0 1 1], ...
                                               'ColumnName', {'Pos X', 'Pos Y', 'Pos Z', 'Dir X', 'Dir Y', 'Dir Z'}, ...
                                               'RowName', {'T1', 'T2', 'T3', 'T4', 'T5', 'T6', 'T7', 'T8'}, ...
@@ -924,66 +970,71 @@ classdef ROVSimGUI < matlab.apps.AppBase
                                               'CellEditCallback', @(s, e) app.updateParameter('r_pos', s.Data, 'ThrusterConfigTable'));
 
             app.ControlPanel = uipanel(app.ParametersTab, 'Title', 'Control Parameters', ...
-                                       'Position', [910 110 450 400], 'FontWeight', 'bold');
-            uilabel(app.ControlPanel, 'Text', 'Pose PID Gains:', 'Position', [10 350 100 22], 'FontWeight', 'bold');
+                                       'Position', [910 60 450 350], 'FontWeight', 'bold');
+            uilabel(app.ControlPanel, 'Text', 'Pose PID Gains:', 'Position', [10 300 100 22], 'FontWeight', 'bold');
             app.GainsTable = uitable(app.ControlPanel, 'Units', 'normalized', 'Position', [0 0.55 1 0.35], ...
                                      'ColumnName', {'Kp', 'Ki', 'Kd'}, 'RowName', {'X', 'Y', 'Z', 'Roll', 'Pitch', 'Yaw'}, ...
                                      'ColumnEditable', true, 'ColumnWidth', 'auto', ...
                                      'Data', zeros(6, 3), ...
                                      'CellEditCallback', @(s, e) app.updateParameter('gains', s.Data, 'GainsTable'));
-            uilabel(app.ControlPanel, 'Text', 'Velocity PID Gains:', 'Position', [10 190 100 22], 'FontWeight', 'bold');
+            uilabel(app.ControlPanel, 'Text', 'Velocity PID Gains:', 'Position', [10 160 100 22], 'FontWeight', 'bold');
             app.VelocityGainsTable = uitable(app.ControlPanel, 'Units', 'normalized', 'Position', [0 0.3 1 0.25], ...
                                              'ColumnName', {'Kv_p', 'Kv_i', 'Kv_d'}, 'RowName', {'X', 'Y', 'Z', 'Roll', 'Pitch', 'Yaw'}, ...
                                              'ColumnEditable', true, 'ColumnWidth', 'auto', ...
                                              'Data', zeros(6, 3), ...
                                              'CellEditCallback', @(s, e) app.updateParameter('gains', s.Data, 'VelocityGainsTable'));
-            uilabel(app.ControlPanel, 'Text', 'Desired Pose:', 'Position', [10 100 100 22], 'FontWeight', 'bold');
+            uilabel(app.ControlPanel, 'Text', 'Desired Pose:', 'Position', [10 80 100 22], 'FontWeight', 'bold');
             app.DesiredPoseTable = uitable(app.ControlPanel, 'Units', 'normalized', 'Position', [0 0 1 0.25], ...
                                            'ColumnName', {'X (m)', 'Y (m)', 'Z (m)', 'Roll (rad)', 'Pitch (rad)', 'Yaw (rad)'}, ...
                                            'ColumnEditable', true, 'Data', [20, 20, 20, 0, 0, 0], 'ColumnWidth', 'auto', ...
                                            'CellEditCallback', @(s, e) app.updateParameter('desired', s.Data, 'DesiredPoseTable'));
 
-            app.UIAxes2D = uiaxes(app.SimulationTab, 'Position', [50 50 1280 780], 'Box', 'on');
+            % Simulation Tab Components
+            app.UIAxes2D = uiaxes(app.SimulationTab, 'Position', [50 20 1280 720], 'Box', 'on');
             title(app.UIAxes2D, 'Real-time Simulation Results');
             xlabel(app.UIAxes2D, 'Time (s)');
             ylabel(app.UIAxes2D, 'State Variables');
 
-            app.UIAxesThruster3D = uiaxes(app.VisualizationTab, 'Position', [20 450 420 380], 'Box', 'on');
+            % Visualization Tab Components
+            app.UIAxesThruster3D = uiaxes(app.VisualizationTab, 'Position', [20 400 420 350], 'Box', 'on');
             title(app.UIAxesThruster3D, '3D Thruster Forces');
-            app.UIAxesTrajectory3D = uiaxes(app.VisualizationTab, 'Position', [460 450 420 380], 'Box', 'on');
+            app.UIAxesTrajectory3D = uiaxes(app.VisualizationTab, 'Position', [460 400 420 350], 'Box', 'on');
             title(app.UIAxesTrajectory3D, '3D Trajectory');
-            app.UIAxesHull3D = uiaxes(app.VisualizationTab, 'Position', [900 450 420 380], 'Box', 'on');
+            app.UIAxesHull3D = uiaxes(app.VisualizationTab, 'Position', [900 400 420 350], 'Box', 'on');
             title(app.UIAxesHull3D, '3D Hull Visualization');
 
-            app.UIAxesError = uiaxes(app.ResultsTab, 'Position', [20 450 640 380], 'Box', 'on');
+            % Results Tab Components
+            app.UIAxesError = uiaxes(app.ResultsTab, 'Position', [20 400 640 350], 'Box', 'on');
             title(app.UIAxesError, 'Error Over Time');
             xlabel(app.UIAxesError, 'Time (s)');
             ylabel(app.UIAxesError, 'Error');
-            app.UIAxesControlEffort = uiaxes(app.ResultsTab, 'Position', [680 450 640 380], 'Box', 'on');
+            app.UIAxesControlEffort = uiaxes(app.ResultsTab, 'Position', [680 400 640 350], 'Box', 'on');
             title(app.UIAxesControlEffort, 'Control Effort (Thrust Magnitude)');
             xlabel(app.UIAxesControlEffort, 'Time (s)');
             ylabel(app.UIAxesControlEffort, 'Thrust (N)');
-            app.ResultsTextArea = uitextarea(app.ResultsTab, 'Position', [20 50 1280 380], ...
+            app.ResultsTextArea = uitextarea(app.ResultsTab, 'Position', [20 20 1280 350], ...
                                              'FontSize', 12, 'Editable', 'off');
 
+            % Drag Fitting Tab Components
             app.NumPointsLabel = uilabel(app.DragFittingTab, 'Text', 'Number of Points:', ...
-                                         'Position', [20 830 120 22], 'FontWeight', 'bold');
-            app.NumPointsEdit = uieditfield(app.DragFittingTab, 'numeric', 'Position', [150 830 100 22], ...
+                                         'Position', [20 750 120 22], 'FontWeight', 'bold');
+            app.NumPointsEdit = uieditfield(app.DragFittingTab, 'numeric', 'Position', [150 750 100 22], ...
                                             'Value', 11, 'Limits', [6 Inf], 'ValueChangedFcn', @(s, e) app.updateDragTables());
-            app.LinearDragTable = uitable(app.DragFittingTab, 'Position', [20 600 600 200], ...
+            app.LinearDragTable = uitable(app.DragFittingTab, 'Position', [20 520 600 200], ...
                                           'ColumnName', {'A', 'B', 'C', 'D'}, ...
                                           'ColumnEditable', true, 'ColumnWidth', 'auto');
-            app.RotationalDragTable = uitable(app.DragFittingTab, 'Position', [650 600 600 200], ...
+            app.RotationalDragTable = uitable(app.DragFittingTab, 'Position', [650 520 600 200], ...
                                               'ColumnName', {'A', 'B', 'C', 'D'}, ...
                                               'ColumnEditable', true, 'ColumnWidth', 'auto');
-            app.UIAxesLinearDrag = uiaxes(app.DragFittingTab, 'Position', [20 350 600 200], 'Box', 'on');
+            app.UIAxesLinearDrag = uiaxes(app.DragFittingTab, 'Position', [20 270 600 200], 'Box', 'on');
             title(app.UIAxesLinearDrag, 'Linear Drag Fit');
-            app.UIAxesRotationalDrag = uiaxes(app.DragFittingTab, 'Position', [650 350 600 200], 'Box', 'on');
+            app.UIAxesRotationalDrag = uiaxes(app.DragFittingTab, 'Position', [650 270 600 200], 'Box', 'on');
             title(app.UIAxesRotationalDrag, 'Rotational Drag Fit');
 
+            % PID Tuning Tab Components
             app.TuningGoalDropDown = uidropdown(app.PIDTuningTab, 'Items', {'Optimized Tuning'}, ...
-                                                'Value', 'Optimized Tuning', 'Position', [50 700 200 22]);
-            app.TunePIDButton = uibutton(app.PIDTuningTab, 'Text', 'Tune PID', 'Position', [50 650 100 30], ...
+                                                'Value', 'Optimized Tuning', 'Position', [50 650 200 22]);
+            app.TunePIDButton = uibutton(app.PIDTuningTab, 'Text', 'Tune PID', 'Position', [50 610 100 25], ...
                                          'ButtonPushedFcn', @(s, e) app.TunePIDAutomatically(s, e));
         end
     end
