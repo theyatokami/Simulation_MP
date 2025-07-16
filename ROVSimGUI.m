@@ -33,6 +33,9 @@ classdef ROVSimGUI < matlab.apps.AppBase
         COMPanel                 matlab.ui.container.Panel
         COMTable                 matlab.ui.control.Table
         
+        COBPanel                 matlab.ui.container.Panel
+        COBTable                 matlab.ui.control.Table
+        
         InertiaPanel             matlab.ui.container.Panel
         InertiaTable             matlab.ui.control.Table
         
@@ -75,6 +78,8 @@ classdef ROVSimGUI < matlab.apps.AppBase
         % PID Tuning Tab Controls
         TuningGoalDropDown       matlab.ui.control.DropDown
         TunePIDButton            matlab.ui.control.Button
+        TuningProgressLabel      matlab.ui.control.Label
+        TuningResultsTextArea    matlab.ui.control.TextArea
     end
 
     properties (Access = private)
@@ -119,9 +124,10 @@ classdef ROVSimGUI < matlab.apps.AppBase
             % Force reload parameters from .mat file
             if isfile(app.matFile)
                 try
-                    load(app.matFile, 'simParams');
+                    loadedData = load(app.matFile, 'simParams');
+                    simParams = loadedData.simParams;
                     % Define required fields
-                    requiredFields = {'mass', 'Vdisp', 'maxThrust', 'com', 'I', 'added', ...
+                    requiredFields = {'mass', 'Vdisp', 'maxThrust', 'com', 'cob', 'I', 'added', ...
                                       'CdA', 'D_rot', 'r_pos', 'dir_thr', 'Kp', 'Ki', 'Kd', ...
                                       'Kv_p', 'Kv_i', 'Kv_d', 'desired', 'polyDragLin', 'polyDragRot', ...
                                       'ts', 't_final', 'Fb'};
@@ -133,24 +139,28 @@ classdef ROVSimGUI < matlab.apps.AppBase
                     else
                         warning('Missing fields in .mat file: %s. Initializing defaults.', strjoin(missingFields, ', '));
                         app.initializeDefaultParameters();
+                        simParams = app.simParams;
                         save(app.matFile, 'simParams');
                     end
                 catch ME
                     uialert(app.UIFigure, sprintf('Error loading .mat: %s. Initializing defaults.', ME.message), 'Error', 'Icon', 'error');
                     app.initializeDefaultParameters();
+                    simParams = app.simParams;
                     save(app.matFile, 'simParams');
                 end
             else
                 app.initializeDefaultParameters();
+                simParams = app.simParams;
                 save(app.matFile, 'simParams');
             end
 
-            % Populate UI components with defaults if not already set
+            % Populate UI components with loaded or default parameters
             try
                 app.MassEdit.Value = app.simParams.mass;
                 app.VdispEdit.Value = app.simParams.Vdisp;
                 app.MaxThrustEdit.Value = app.simParams.maxThrust;
                 app.COMTable.Data = app.simParams.com';
+                app.COBTable.Data = app.simParams.cob';
                 app.InertiaTable.Data = diag(app.simParams.I)';
                 app.AddedMassTable.Data = diag(app.simParams.added)';
                 app.CdATable.Data = app.simParams.CdA';
@@ -161,8 +171,9 @@ classdef ROVSimGUI < matlab.apps.AppBase
                 app.DesiredPoseTable.Data = app.simParams.desired';
                 app.NumPointsEdit.Value = 11;
                 app.updateDragTables();
-                app.TuningGoalDropDown.Items = {'Optimized Tuning'};
-                app.TuningGoalDropDown.Value = 'Optimized Tuning';
+                app.TuningGoalDropDown.Items = {'Fast Response', 'Minimal Overshoot', 'Balanced Performance'};
+                app.TuningGoalDropDown.Value = 'Balanced Performance';
+                app.TuningResultsTextArea.Value = '';
             catch ME
                 uialert(app.UIFigure, sprintf('Error populating UI: %s', ME.message), 'Error', 'Icon', 'error');
             end
@@ -179,19 +190,21 @@ classdef ROVSimGUI < matlab.apps.AppBase
             p.ts = 0.1; % Time step in s
             p.t_final = 120; % Total simulation time in s
             p.com = [-0.42049; 0.00072; -0.02683]; % Center of Mass (m)
+            p.cob = [0; 0; 0.05]; % Center of Buoyancy (m), slightly above COM
             p.I = diag([1.990993, 15.350344, 15.774167]); % Inertia matrix (diagonal, kg·m²)
             p.added = diag([5, 5, 10, 1, 1, 1]); % Added mass matrix (diagonal)
-            p.CdA = [0.5 * 1000 * 1.1 * 0.04; 0.5 * 1000 * 1.1 * 0.1; 0.5 * 1000 * 1.1 * 0.1]; % Linear drag coefficients (N·s²/m²)
+            p.CdA = [550; 550; 550]; % Linear drag coefficients (adjusted for realistic damping)
             p.D_rot = diag([5, 5, 5]); % Rotational drag matrix (diagonal)
             p.r_pos = [0.2, 0.1, 0.1; 0.2, -0.1, 0.1; -0.2, -0.1, 0.1; -0.2, 0.1, 0.1;
                        0.2, 0.1, 0; 0.2, -0.1, 0; -0.2, -0.1, 0; -0.2, 0.1, 0]; % Thruster positions (m)
             deg = [nan, nan, nan, nan, -45, 45, 135, -135];
             p.dir_thr = [repmat([0, 0, 1], 4, 1); [cosd(deg(5:8))', sind(deg(5:8))', zeros(4, 1)]]; % Thruster directions
-            p.Kp = diag([4, 4, 4, 0.8, 0.8, 1]); % Outer loop PID gains (pose control)
-            p.Ki = diag([0.001, 0.001, 0.001, 0, 0, 0]);
-            p.Kd = diag([0.6, 0.6, 0.6, 1.5, 1.5, 2]);
-            p.Kv_p = diag([10, 10, 10, 5, 5, 5]); % Inner loop PID gains (velocity control)
-            p.Kv_i = diag([0.01, 0.01, 0.01, 0, 0, 0]);
+            % Conservative initial PID gains to ensure stability
+            p.Kp = diag([2, 2, 2, 0.5, 0.5, 0.5]); % Outer loop PID gains (pose control)
+            p.Ki = diag([0.01, 0.01, 0.01, 0, 0, 0]);
+            p.Kd = diag([1, 1, 1, 0.5, 0.5, 0.5]);
+            p.Kv_p = diag([5, 5, 5, 2, 2, 2]); % Inner loop PID gains (velocity control)
+            p.Kv_i = diag([0.05, 0.05, 0.05, 0, 0, 0]);
             p.Kv_d = diag([2, 2, 2, 1, 1, 1]);
             p.desired = [20; 20; 20; 0; 0; 0]; % Desired pose (x, y, z in m; roll, pitch, yaw in rad)
             p.polyDragLin = []; % Drag polynomial fits (empty by default)
@@ -355,194 +368,245 @@ classdef ROVSimGUI < matlab.apps.AppBase
             end
         end
 
-        % --- Automatic PID Tuning ---
+        % --- PID Tuning ---
         function TunePIDAutomatically(app, ~, ~)
-            % Automatically tune PID gains for optimized performance
-            p = app.simParams;
+    % Automatically tune PID gains for ROV using manual tuning based on second-order model
+    app.TuningProgressLabel.Text = 'Tuning in progress...';
+    drawnow;
 
-            % Define tighter gain bounds
-            Kp_lb = zeros(6, 1); Kp_ub = 5 * ones(6, 1);
-            Ki_lb = zeros(6, 1); Ki_ub = 0.05 * ones(6, 1);
-            Kd_lb = zeros(6, 1); Kd_ub = 1 * ones(6, 1);
-            Kv_p_lb = zeros(6, 1); Kv_p_ub = 10 * ones(6, 1);
-            Kv_i_lb = zeros(6, 1); Kv_i_ub = 0.05 * ones(6, 1);
-            Kv_d_lb = zeros(6, 1); Kv_d_ub = 1 * ones(6, 1);
+    try
+        % Ensure simParams is initialized
+        if isempty(app.simParams)
+            app.initializeDefaultParameters();
+        end
+        p = app.simParams;
 
-            % Initial guess (current values)
-            Kp0 = diag(app.simParams.Kp);
-            Ki0 = diag(app.simParams.Ki);
-            Kd0 = diag(app.simParams.Kd);
-            Kv_p0 = diag(app.simParams.Kv_p);
-            Kv_i0 = diag(app.simParams.Kv_i);
-            Kv_d0 = diag(app.simParams.Kv_d);
-
-            % Objective function for optimization
-            costFunc = @(x) app.computeCost(x, p);
-
-            % Optimization variables: [Kp Ki Kd Kv_p Kv_i Kv_d] for all 6 axes
-            x0 = [Kp0; Ki0; Kd0; Kv_p0; Kv_i0; Kv_d0];
-            lb = [Kp_lb; Ki_lb; Kd_lb; Kv_p_lb; Kv_i_lb; Kv_d_lb];
-            ub = [Kp_ub; Ki_ub; Kd_ub; Kv_p_ub; Kv_i_ub; Kv_d_ub];
-
-            % Use fmincon for constrained optimization
-            options = optimoptions('fmincon', 'Display', 'iter', 'MaxIterations', 50, 'MaxFunctionEvaluations', 500);
-            [x_opt, ~] = fmincon(costFunc, x0, [], [], [], [], lb, ub, [], options);
-
-            % Extract optimized gains
-            idx = 1:6;
-            app.simParams.Kp = diag(x_opt(idx));
-            app.simParams.Ki = diag(x_opt(idx + 6));
-            app.simParams.Kd = diag(x_opt(idx + 12));
-            app.simParams.Kv_p = diag(x_opt(idx + 18));
-            app.simParams.Kv_i = diag(x_opt(idx + 24));
-            app.simParams.Kv_d = diag(x_opt(idx + 30));
-
-            % Update UI tables
-            app.GainsTable.Data = [diag(app.simParams.Kp), diag(app.simParams.Ki), diag(app.simParams.Kd)];
-            app.VelocityGainsTable.Data = [diag(app.simParams.Kv_p), diag(app.simParams.Kv_i), diag(app.simParams.Kv_d)];
-            app.saveParametersToMat();
-            uialert(app.UIFigure, 'PID tuned for optimized performance (minimal overshoot, minimal error, faster response) successfully.', 'Success', 'Icon', 'success');
+        % Validate critical parameters
+        requiredFields = {'mass', 'added', 'I', 'CdA', 'D_rot', 'ts', 'maxThrust', 'r_pos', 'dir_thr', 'desired'};
+        missingFields = requiredFields(~isfield(p, requiredFields));
+        if ~isempty(missingFields)
+            error('Missing simParams fields: %s', strjoin(missingFields, ', '));
+        end
+        if size(p.added, 1) ~= 6 || size(p.added, 2) ~= 6
+            error('Added mass matrix must be 6x6.');
+        end
+        if size(p.I, 1) ~= 3 || size(p.I, 2) ~= 3
+            error('Inertia matrix must be 3x3.');
+        end
+        if length(p.CdA) ~= 3
+            error('CdA must be a 3x1 vector.');
+        end
+        if size(p.D_rot, 1) ~= 3 || size(p.D_rot, 2) ~= 3
+            error('D_rot must be a 3x3 matrix.');
+        end
+        if size(p.r_pos, 1) ~= 8 || size(p.r_pos, 2) ~= 3
+            error('r_pos must be 8x3.');
+        end
+        if size(p.dir_thr, 1) ~= 8 || size(p.dir_thr, 2) ~= 3
+            error('dir_thr must be 8x3.');
+        end
+        if length(p.desired) ~= 6
+            error('desired must be a 6x1 vector.');
         end
 
-        % --- Cost Function for PID Tuning ---
-        function cost = computeCost(app, x, p)
-            % Simulate with current gains and compute cost for optimized tuning
-            p.Kp = diag(x(1:6));
-            p.Ki = diag(x(7:12));
-            p.Kd = diag(x(13:18));
-            p.Kv_p = diag(x(19:24));
-            p.Kv_i = diag(x(25:30));
-            p.Kv_d = diag(x(31:36));
-        
-            % Longer simulation to evaluate steady-state
-            N = round(p.t_final / p.ts);
-            timeVec = (0:N-1) * p.ts;
-            stateHistory = zeros(12, N);
-            errorHistory = zeros(6, N);
-            thrustHistory = zeros(8, N);
-        
-            M = [p.mass * eye(3) + p.added(1:3,1:3), zeros(3); zeros(3), p.I + p.added(4:6,4:6)];
-            invM_lin = inv(M(1:3,1:3));
-            invM_ang = inv(M(4:6,4:6));
-            A = zeros(6, 8);
-            for i = 1:8
-                d = p.dir_thr(i, :)';
-                r = p.r_pos(i, :)';
-                A(1:3, i) = d;
-                A(4:6, i) = cross(r, d);
+        % Initialize gains
+        Kp = zeros(6, 1); Ki = zeros(6, 1); Kd = zeros(6, 1);
+        Kv_p = zeros(6, 1); Kv_i = zeros(6, 1); Kv_d = zeros(6, 1);
+        overshoot_data = zeros(6, 1);
+        settling_time = zeros(6, 1);
+
+        % Define plant models for each DOF
+        s = tf('s');
+        G_trans = cell(3, 1); % Translational DOFs (x, y, z)
+        G_rot = cell(3, 1);   % Rotational DOFs (roll, pitch, yaw)
+        for i = 1:3
+            mass_total = p.mass + p.added(i,i);
+            if mass_total <= 0
+                error('Invalid mass for axis %d: must be positive.', i);
             end
-            Q = A' * A + 1e-3 * eye(8);
-            opts = optimoptions('quadprog', 'Display', 'off');
-        
+            G_trans{i} = 1 / (mass_total * s^2 + p.CdA(i) * s);
+        end
+        for i = 1:3
+            inertia_total = p.I(i,i) + p.added(i+3,i+3);
+            if inertia_total <= 0
+                error('Invalid inertia for axis %d: must be positive.', i);
+            end
+            G_rot{i} = 1 / (inertia_total * s^2 + p.D_rot(i,i) * s);
+        end
+
+        % Tuning parameters
+        tuningGoal = app.TuningGoalDropDown.Value;
+        switch tuningGoal
+            case 'Fast Response'
+                wc_pose = 0.7; % Bandwidth (rad/s)
+                wc_vel = 1.4;
+                pm_pose = 60; % Phase margin (degrees)
+                pm_vel = 70;
+            case 'Minimal Overshoot'
+                wc_pose = 0.3;
+                wc_vel = 0.6;
+                pm_pose = 80;
+                pm_vel = 90;
+            case 'Balanced Performance'
+                wc_pose = 0.5;
+                wc_vel = 1.0;
+                pm_pose = 65;
+                pm_vel = 75;
+            otherwise
+                error('Invalid tuning goal: %s', tuningGoal);
+        end
+
+        % Tune PID gains manually
+        for i = 1:6
+            if i <= 3
+                G = G_trans{i};
+                m = p.mass + p.added(i,i);
+                b = p.CdA(i);
+            else
+                G = G_rot{i-3};
+                m = p.I(i-3,i-3) + p.added(i+3,i+3);
+                b = p.D_rot(i-3,i-3);
+            end
+            % Pose loop: Kp = m * wc^2, Kd = 2 * m * wc * zeta, Ki = Kp * wc / 10
+            zeta_pose = sqrt(1 - (pm_pose * pi/180)^2) / (pm_pose * pi/180); % Damping ratio from phase margin
+            Kp(i) = max(m * wc_pose^2, 0.5);
+            Kd(i) = max(2 * m * wc_pose * zeta_pose, 0.5);
+            Ki(i) = max(Kp(i) * wc_pose / 10, 0.01);
+            % Velocity loop: more aggressive
+            zeta_vel = sqrt(1 - (pm_vel * pi/180)^2) / (pm_vel * pi/180);
+            Kv_p(i) = max(m * wc_vel^2, 1.0);
+            Kv_i(i) = max(Kv_p(i) * wc_vel / 8, 0.05);
+            Kv_d(i) = max(2 * m * wc_vel * zeta_vel, 1.0);
+        end
+
+        % Validate gains with closed-loop simulation
+        ts = p.ts;
+        t_sim = 0:ts:10; % 10s for validation
+        M = [p.mass * eye(3) + p.added(1:3,1:3), zeros(3); zeros(3), p.I + p.added(4:6,4:6)];
+        invM = inv(M);
+        A = zeros(6, 8);
+        for i = 1:8
+            d = p.dir_thr(i, :)';
+            r = p.r_pos(i, :)';
+            A(1:3, i) = d;
+            A(4:6, i) = cross(r, d);
+        end
+        Q = A' * A + 1e-3 * eye(8);
+        opts_qp = optimoptions('quadprog', 'Display', 'off');
+
+        for i = 1:6
             state = zeros(12, 1);
-            intErr = zeros(6, 1);
-            prevErr = p.desired;
-            v_intErr = zeros(6, 1);
-            v_prevErr = zeros(6, 1);
-            thr_e = zeros(8, 1);
-            thr_a = zeros(8, 1);
-            Tmax = p.maxThrust;
-            tau_e = 0.05;
-            tau_m = 0.15;
-            alpha_e = p.ts / (tau_e + p.ts);
-            alpha_m = p.ts / (tau_m + p.ts);
-        
-            for k = 2:N
-                err = p.desired - state(1:6);
-                errorHistory(:, k) = err;
-                intErr = intErr + err * p.ts;
-                dErr = (err - prevErr) / p.ts;
-                prevErr = err;
-                v_desired = p.Kp * err + p.Ki * intErr + p.Kd * dErr;
-        
-                v_err = v_desired - state(7:12);
-                v_intErr = v_intErr + v_err * p.ts;
-                v_dErr = (v_err - v_prevErr) / p.ts;
-                v_prevErr = v_err;
-                tau = p.Kv_p * v_err + p.Kv_i * v_intErr + p.Kv_d * v_dErr;
-        
-                tc = quadprog(Q, -A' * tau, [], [], [], [], -Tmax * ones(8, 1), Tmax * ones(8, 1), [], opts);
-                thrustHistory(:, k) = tc;
-        
-                thr_e = alpha_e * tc + (1 - alpha_e) * thr_e;
-                thr_a = alpha_m * thr_e + (1 - alpha_m) * thr_a;
-        
+            y = zeros(length(t_sim), 1);
+            integral = 0;
+            prev_error = 0;
+            v_integral = 0;
+            v_prev_error = 0;
+            step_size = (i <= 3) * 1 + (i > 3) * 0.1; % 1m for trans, 0.1rad for rot
+            for k = 1:length(t_sim)
+                if i > 6 || i < 1
+                    error('Invalid DOF index %d: must be between 1 and 6.', i);
+                end
+                pose_error = step_size - state(i);
+                integral = integral + pose_error * ts;
+                derivative = (pose_error - prev_error) / ts;
+                vel_des = Kp(i) * pose_error + Ki(i) * integral + Kd(i) * derivative;
+                vel_error = vel_des - state(6+i);
+                v_integral = v_integral + vel_error * ts;
+                v_derivative = (vel_error - v_prev_error) / ts;
+                u = zeros(6, 1);
+                u(i) = Kv_p(i) * vel_error + Kv_i(i) * v_integral + Kv_d(i) * v_derivative;
+                tc = quadprog(Q, -A' * u, [], [], [], [], -p.maxThrust * ones(8, 1), p.maxThrust * ones(8, 1), [], opts_qp);
+                F = A * tc;
                 vLin = state(7:9);
                 vRot = state(10:12);
-                if ~isempty(p.polyDragLin)
-                    F = zeros(3, 1);
-                    for i = 1:3
-                        F(i) = polyval(p.polyDragLin(i, :), vLin(i));
-                    end
-                else
-                    F = -p.CdA .* abs(vLin) .* vLin;
-                end
-                if ~isempty(p.polyDragRot)
-                    M_t = zeros(3, 1);
-                    for i = 1:3
-                        M_t(i) = polyval(p.polyDragRot(i, :), vRot(i));
-                    end
-                else
-                    M_t = -p.D_rot * vRot;
-                end
-                TF = A * thr_a;
-                F = F + TF(1:3);
-                M_t = M_t + TF(4:6) + cross(p.com, [0; 0; (p.Fb - p.mass * 9.81)]);
-        
-                acc_lin = invM_lin * F;
-                acc_ang = invM_ang * M_t;
-                state(7:9) = state(7:9) + acc_lin * p.ts;
-                state(10:12) = state(10:12) + acc_ang * p.ts;
-                state(1:3) = state(1:3) + state(7:9) * p.ts + 0.5 * acc_lin * p.ts^2;
-                state(4:6) = state(4:6) + state(10:12) * p.ts + 0.5 * acc_ang * p.ts^2;
-                stateHistory(:, k) = state;
+                drag_lin = -p.CdA .* abs(vLin) .* vLin;
+                drag_rot = -p.D_rot * vRot;
+                F(1:3) = F(1:3) + drag_lin + [0; 0; (p.Fb - p.mass * 9.81)];
+                r_cob = p.cob - p.com;
+                F(4:6) = F(4:6) + drag_rot + cross(r_cob, [0; 0; p.Fb]);
+                acc = invM * F;
+                state(7:12) = state(7:12) + acc * ts;
+                state(1:6) = state(1:6) + state(7:12) * ts;
+                y(k) = state(i);
+                prev_error = pose_error;
+                v_prev_error = vel_error;
             end
-        
-            % Compute cost components with increased emphasis on translation axes
-            thresholds = 0.05 * abs(p.desired); % 5% of desired value
-            arrival_times = zeros(6, 1);
-            for i = 1:6
-                err = abs(errorHistory(i, :));
-                idx = find(err < thresholds(i), 1, 'first');
-                arrival_times(i) = timeVec(min(idx, N));
+            overshoot_data(i) = max(0, max(y) - step_size) / step_size;
+            settling_idx = find(abs(y - step_size) > 0.05 * step_size, 1, 'last');
+            if isempty(settling_idx)
+                settling_time(i) = t_sim(end);
+            else
+                settling_time(i) = t_sim(min(settling_idx + 1, length(t_sim)));
             end
-            time_cost = mean(arrival_times) + 10 * max(arrival_times); % Scalar
-        
-            final_err = errorHistory(:, end);
-            error_cost = 2 * mean(abs(final_err(1:3))) + mean(abs(final_err(4:6))) + 10 * max(abs(final_err)); % Double weight on translation
-        
-            max_overshoot = max(abs(errorHistory), [], 2) - abs(p.desired); % Vector of overshoots
-            overshoot_cost = 2 * mean(max(max_overshoot(1:3, max_overshoot(1:3, :) > 0), 0)) + mean(max(max_overshoot(4:6, max_overshoot(4:6, :) > 0), 0)) ...
-                           + 10 * max(max_overshoot(max_overshoot > 0), 0); % Double weight on translation
-        
-            % Penalty for large errors (exceeding 5% of desired)
-            error_penalty = 0;
-            for i = 1:6
-                if any(abs(errorHistory(i, :)) > 1.05 * abs(p.desired(i)))
-                    error_penalty = error_penalty + 100 * mean(abs(errorHistory(i, errorHistory(i, :) > 1.05 * abs(p.desired(i)))));
-                end
-            end
-        
-            % Weighted sum with adjusted priorities
-            w1 = 0.5; w2 = 0.4; w3 = 0.1; % Increased overshoot weight, reduced time weight
-            cost = w1 * overshoot_cost + w2 * error_cost + w3 * time_cost + error_penalty;
-        
-            % Debug output to check dimensions
-            disp(['overshoot_cost size: ', mat2str(size(overshoot_cost))]);
-            disp(['error_cost size: ', mat2str(size(error_cost))]);
-            disp(['time_cost size: ', mat2str(size(time_cost))]);
-            disp(['error_penalty size: ', mat2str(size(error_penalty))]);
-            disp(['cost size: ', mat2str(size(cost))]);
-        
-            % Force scalar if not already
-            cost = sum(cost(:));
-        
-            % Add penalty for instability
-            if any(isnan(stateHistory(:))) || any(isinf(stateHistory(:)))
-                cost = cost + 1000;
+
+            % Adjust gains if performance is poor
+            if overshoot_data(i) > 0.10 || settling_time(i) > 6
+                Kp(i) = Kp(i) * 0.7;
+                Ki(i) = Ki(i) * 0.5;
+                Kd(i) = Kd(i) * 0.8;
+                Kv_p(i) = Kv_p(i) * 0.7;
+                Kv_i(i) = Kv_i(i) * 0.5;
+                Kv_d(i) = Kv_d(i) * 0.8;
             end
         end
 
+        % Gain scheduling based on desired pose
+        desired_norm = norm(p.desired(1:3));
+        if desired_norm > 10
+            Kp = Kp * 1.1; % Modest increase
+            Kv_p = Kv_p * 1.1;
+        elseif desired_norm < 2
+            Kp = Kp * 0.9; % Modest decrease
+            Kv_p = Kv_p * 0.9;
+        end
+
+        % Apply tuned gains
+        app.simParams.Kp = diag(Kp);
+        app.simParams.Ki = diag(Ki);
+        app.simParams.Kd = diag(Kd);
+        app.simParams.Kv_p = diag(Kv_p);
+        app.simParams.Kv_i = diag(Kv_i);
+        app.simParams.Kv_d = diag(Kv_d);
+
+        % Update UI tables
+        app.GainsTable.Data = [Kp, Ki, Kd];
+        app.VelocityGainsTable.Data = [Kv_p, Kv_i, Kv_d];
+        app.saveParametersToMat();
+
+        % Display tuning results
+        resultsStr = sprintf('PID Tuning Results (%s, Manual Tuning):\n\n', tuningGoal);
+        resultsStr = [resultsStr, sprintf('Model Parameters Used:\n')];
+        for i = 1:3
+            resultsStr = [resultsStr, sprintf('  Trans Axis %d: Mass=%.2f kg, Damping=%.2f Ns/m\n', ...
+                i, p.mass + p.added(i,i), p.CdA(i))];
+        end
+        for i = 1:3
+            resultsStr = [resultsStr, sprintf('  Rot Axis %d: Inertia=%.2f kg·m², Damping=%.2f Nms/rad\n', ...
+                i, p.I(i,i) + p.added(i+3,i+3), p.D_rot(i,i))];
+        end
+        resultsStr = [resultsStr, sprintf('\nPose PID Gains (Phase Margin: %.1f°):\n', pm_pose)];
+        for i = 1:6
+            resultsStr = [resultsStr, sprintf('  Axis %d: Kp=%.4f, Ki=%.4f, Kd=%.4f\n', ...
+                i, Kp(i), Ki(i), Kd(i))];
+        end
+        resultsStr = [resultsStr, sprintf('\nVelocity PID Gains (Phase Margin: %.1f°):\n', pm_vel)];
+        for i = 1:6
+            resultsStr = [resultsStr, sprintf('  Axis %d: Kv_p=%.4f, Kv_i=%.4f, Kv_d=%.4f\n', ...
+                i, Kv_p(i), Kv_i(i), Kv_d(i))];
+        end
+        resultsStr = [resultsStr, sprintf('\nPerformance Metrics:\n')];
+        for i = 1:6
+            resultsStr = [resultsStr, sprintf('  Axis %d: Overshoot=%.2f%%, Settling Time=%.2fs\n', ...
+                i, overshoot_data(i)*100, settling_time(i))];
+        end
+        app.TuningResultsTextArea.Value = resultsStr;
+        app.TuningProgressLabel.Text = 'Tuning completed successfully.';
+        uialert(app.UIFigure, sprintf('PID tuning completed for %s.', tuningGoal), 'Success', 'Icon', 'success');
+    catch ME
+        app.TuningProgressLabel.Text = 'Tuning failed.';
+        uialert(app.UIFigure, sprintf('PID tuning error: %s', ME.message), 'Error', 'Icon', 'error');
+    end
+end
         % --- Simulation Execution ---
         function RunSim(app, ~, ~)
             % Run the ROV simulation with cascade PID control
@@ -551,6 +615,7 @@ classdef ROVSimGUI < matlab.apps.AppBase
                 app.simParams.Vdisp = app.VdispEdit.Value;
                 app.simParams.maxThrust = app.MaxThrustEdit.Value;
                 app.simParams.com = app.COMTable.Data';
+                app.simParams.cob = app.COBTable.Data';
                 app.simParams.I = diag(app.InertiaTable.Data);
                 app.simParams.added = diag(app.AddedMassTable.Data);
                 app.simParams.r_pos = app.ThrusterConfigTable.Data(:, 1:3);
@@ -617,12 +682,16 @@ classdef ROVSimGUI < matlab.apps.AppBase
             end
             title(ax2, 'Simulation Results'); legend(ax2, 'show'); hold(ax2, 'off');
 
+            % 3D Thruster Plot with Buoyancy and Weight
             axT = app.UIAxesThruster3D; cla(axT); hold(axT, 'on');
             quiv = gobjects(8, 1);
             for i = 1:8
                 quiv(i) = quiver3(axT, 0, 0, 0, 0, 0, 0, 'r', 'MaxHeadSize', 0.5, 'DisplayName', sprintf('Thruster %d', i));
             end
-            grid(axT, 'on'); axis(axT, 'equal'); title(axT, '3D Thruster Forces'); hold(axT, 'off');
+            % Buoyancy and weight arrows
+            quiv_buoy = quiver3(axT, 0, 0, 0, 0, 0, 0, 'b', 'MaxHeadSize', 0.5, 'DisplayName', 'Buoyancy');
+            quiv_weight = quiver3(axT, 0, 0, 0, 0, 0, 0, 'k', 'MaxHeadSize', 0.5, 'DisplayName', 'Weight');
+            grid(axT, 'on'); axis(axT, 'equal'); title(axT, '3D Thruster Forces with Buoyancy and Weight'); legend(axT, 'show'); hold(axT, 'off');
 
             axTraj = app.UIAxesTrajectory3D; cla(axTraj); hold(axTraj, 'on');
             hTraj = animatedline(axTraj, 'Color', 'b', 'LineWidth', 1.5, 'DisplayName', 'Trajectory');
@@ -646,7 +715,8 @@ classdef ROVSimGUI < matlab.apps.AppBase
             tau_m = 0.15;
             alpha_e = p.ts / (tau_e + p.ts);
             alpha_m = p.ts / (tau_m + p.ts);
-            arwScale = 0.1;
+            arwScale = 0.1; % Scaling for thruster arrows
+            forceScale = 0.001; % Scaling for buoyancy and weight arrows (adjusted for visibility)
 
             app.errorHistory(:, 1) = p.desired - state(1:6);
 
@@ -692,7 +762,12 @@ classdef ROVSimGUI < matlab.apps.AppBase
                     end
                     TF = A * thr_a;
                     F = F + TF(1:3);
-                    M_t = M_t + TF(4:6) + cross(p.com, [0; 0; (p.Fb - p.mass * 9.81)]);
+                    buoyancy_force = [0; 0; p.Fb];
+                    weight_force = [0; 0; -p.mass * 9.81];
+                    r_cob = p.cob - p.com;
+                    M_buoyancy = cross(r_cob, buoyancy_force);
+                    F = F + buoyancy_force + weight_force;
+                    M_t = M_t + TF(4:6) + M_buoyancy;
 
                     acc_lin = invM_lin * F;
                     acc_ang = invM_ang * M_t;
@@ -710,12 +785,23 @@ classdef ROVSimGUI < matlab.apps.AppBase
                         addpoints(hVel.(vcoords{i}), tnow, state(6+i));
                         addpoints(hAng.(acoords{i}), tnow, state(9+i));
                     end
+                    % Update thruster, buoyancy, and weight arrows
                     for i = 1:8
                         pos = state(1:3) + p.r_pos(i, :)';
                         vec = p.dir_thr(i, :)' * thr_a(i) * arwScale;
                         set(quiv(i), 'XData', pos(1), 'YData', pos(2), 'ZData', pos(3), ...
                                      'UData', vec(1), 'VData', vec(2), 'WData', vec(3));
                     end
+                    % Buoyancy at cob (upward, blue)
+                    pos_buoy = state(1:3) + p.cob;
+                    vec_buoy = buoyancy_force * forceScale;
+                    set(quiv_buoy, 'XData', pos_buoy(1), 'YData', pos_buoy(2), 'ZData', pos_buoy(3), ...
+                                   'UData', vec_buoy(1), 'VData', vec_buoy(2), 'WData', vec_buoy(3));
+                    % Weight at com (downward, black)
+                    pos_weight = state(1:3) + p.com;
+                    vec_weight = weight_force * forceScale;
+                    set(quiv_weight, 'XData', pos_weight(1), 'YData', pos_weight(2), 'ZData', pos_weight(3), ...
+                                     'UData', vec_weight(1), 'VData', vec_weight(2), 'WData', vec_weight(3));
                     addpoints(hTraj, state(1), state(2), state(3));
 
                     phi = state(4); th = state(5); psi = state(6);
@@ -770,7 +856,8 @@ classdef ROVSimGUI < matlab.apps.AppBase
             hold(axEff, 'off');
 
             resultsStr = sprintf('Simulation Results:\n\n');
-            thresholds = 0.05 * max(abs(app.simParams.desired), 0.1);
+            desired_norm = max(abs(app.simParams.desired), [0.1; 0.1; 0.1; 0.01; 0.01; 0.01]);
+            thresholds = 0.05 * desired_norm;
             arrival_times = zeros(6, 1);
             final_err = app.errorHistory(:, end);
             for i = 1:6
@@ -813,7 +900,7 @@ classdef ROVSimGUI < matlab.apps.AppBase
             resultsStr = [resultsStr, sprintf('\nTotal Control Effort: %.2f N²s\n', energy)];
 
             if any(isinf(arrival_times(4:6)))
-                resultsStr = [resultsStr, sprintf('\nWarning: Orientation (Roll, Pitch, Yaw) may be unstable. Consider increasing angular PID gains or checking thruster configuration.\n')];
+                resultsStr = [resultsStr, sprintf('\nWarning: Orientation (Roll, Pitch, Yaw) may be unstable. Consider adjusting thruster configuration.\n')];
             end
 
             app.ResultsTextArea.Value = resultsStr;
@@ -833,6 +920,8 @@ classdef ROVSimGUI < matlab.apps.AppBase
                     app.simParams.CdA = value';
                 elseif strcmp(tableName, 'COMTable')
                     app.simParams.com = value';
+                elseif strcmp(tableName, 'COBTable')
+                    app.simParams.cob = value';
                 elseif strcmp(tableName, 'GainsTable')
                     app.simParams.Kp = diag(value(:,1));
                     app.simParams.Ki = diag(value(:,2));
@@ -867,6 +956,8 @@ classdef ROVSimGUI < matlab.apps.AppBase
             cla(app.UIAxesError);
             cla(app.UIAxesControlEffort);
             app.ResultsTextArea.Value = '';
+            app.TuningResultsTextArea.Value = '';
+            app.TuningProgressLabel.Text = '';
             app.stateHistory = [];
             app.thrustHistory = [];
             app.errorHistory = [];
@@ -906,7 +997,7 @@ classdef ROVSimGUI < matlab.apps.AppBase
             app.ResetDefaultsButton = uibutton(app.UIFigure, 'Text', 'Reset to Defaults', 'Position', [670 850 120 25], ...
                                                'ButtonPushedFcn', @(s, e) app.resetToDefaults());
 
-            % Parameters Tab Components (scaled to fit TabGroup height of 800)
+            % Parameters Tab Components
             app.BasicPropsPanel = uipanel(app.ParametersTab, 'Title', 'Basic Properties', ...
                                           'Position', [20 650 350 120], 'FontWeight', 'bold');
             app.MassLabel = uilabel(app.BasicPropsPanel, 'Text', 'Mass (kg):', ...
@@ -932,15 +1023,22 @@ classdef ROVSimGUI < matlab.apps.AppBase
                                    'Data', [0 0 0], ...
                                    'CellEditCallback', @(s, e) app.updateParameter('com', s.Data, 'COMTable'));
 
+            app.COBPanel = uipanel(app.ParametersTab, 'Title', 'Center of Buoyancy (m)', ...
+                                   'Position', [20 370 350 100], 'FontWeight', 'bold');
+            app.COBTable = uitable(app.COBPanel, 'Units', 'normalized', 'Position', [0 0 1 1], ...
+                                   'ColumnName', {'X', 'Y', 'Z'}, 'ColumnEditable', true, 'ColumnWidth', 'auto', ...
+                                   'Data', [0 0 0], ...
+                                   'CellEditCallback', @(s, e) app.updateParameter('cob', s.Data, 'COBTable'));
+
             app.InertiaPanel = uipanel(app.ParametersTab, 'Title', 'Inertia Matrix Diagonal (kg m²)', ...
-                                       'Position', [20 380 350 100], 'FontWeight', 'bold');
+                                       'Position', [20 230 350 100], 'FontWeight', 'bold');
             app.InertiaTable = uitable(app.InertiaPanel, 'Units', 'normalized', 'Position', [0 0 1 1], ...
                                        'ColumnName', {'Ixx', 'Iyy', 'Izz'}, 'ColumnEditable', true, 'ColumnWidth', 'auto', ...
                                        'Data', [0 0 0], ...
                                        'CellEditCallback', @(s, e) app.updateParameter('I', s.Data, 'InertiaTable'));
 
             app.AddedMassPanel = uipanel(app.ParametersTab, 'Title', 'Added Mass Diagonal', ...
-                                         'Position', [20 250 350 100], 'FontWeight', 'bold');
+                                         'Position', [20 90 350 100], 'FontWeight', 'bold');
             app.AddedMassTable = uitable(app.AddedMassPanel, 'Units', 'normalized', 'Position', [0 0 1 1], ...
                                          'ColumnName', {'Am11', 'Am22', 'Am33', 'Am44', 'Am55', 'Am66'}, ...
                                          'ColumnEditable', true, 'ColumnWidth', 'auto', ...
@@ -948,20 +1046,20 @@ classdef ROVSimGUI < matlab.apps.AppBase
                                          'CellEditCallback', @(s, e) app.updateParameter('added', s.Data, 'AddedMassTable'));
 
             app.DragPanel = uipanel(app.ParametersTab, 'Title', 'Drag Coefficients', ...
-                                    'Position', [20 60 350 170], 'FontWeight', 'bold');
-            uilabel(app.DragPanel, 'Text', 'CdA (Linear Drag):', 'Position', [10 120 150 22], 'FontWeight', 'bold');
-            app.CdATable = uitable(app.DragPanel, 'Units', 'normalized', 'Position', [0 0.5 1 0.5], ...
+                                    'Position', [390 60 350 350], 'FontWeight', 'bold');
+            uilabel(app.DragPanel, 'Text', 'CdA (Linear Drag):', 'Position', [10 300 150 22], 'FontWeight', 'bold');
+            app.CdATable = uitable(app.DragPanel, 'Units', 'normalized', 'Position', [0 0.55 1 0.45], ...
                                    'ColumnName', {'CdAx', 'CdAy', 'CdAz'}, 'ColumnEditable', true, 'ColumnWidth', 'auto', ...
                                    'Data', [0 0 0], ...
                                    'CellEditCallback', @(s, e) app.updateParameter('CdA', s.Data, 'CdATable'));
-            uilabel(app.DragPanel, 'Text', 'Rotational Drag:', 'Position', [10 40 150 22], 'FontWeight', 'bold');
+            uilabel(app.DragPanel, 'Text', 'Rotational Drag:', 'Position', [10 140 150 22], 'FontWeight', 'bold');
             app.DrotTable = uitable(app.DragPanel, 'Units', 'normalized', 'Position', [0 0 1 0.4], ...
                                     'ColumnName', {'Dr11', 'Dr22', 'Dr33'}, 'ColumnEditable', true, 'ColumnWidth', 'auto', ...
                                     'Data', [0 0 0], ...
                                     'CellEditCallback', @(s, e) app.updateParameter('D_rot', s.Data, 'DrotTable'));
 
             app.ThrusterPanel = uipanel(app.ParametersTab, 'Title', 'Thruster Configuration', ...
-                                        'Position', [390 60 500 350], 'FontWeight', 'bold');
+                                        'Position', [760 60 500 350], 'FontWeight', 'bold');
             app.ThrusterConfigTable = uitable(app.ThrusterPanel, 'Units', 'normalized', 'Position', [0 0 1 1], ...
                                               'ColumnName', {'Pos X', 'Pos Y', 'Pos Z', 'Dir X', 'Dir Y', 'Dir Z'}, ...
                                               'RowName', {'T1', 'T2', 'T3', 'T4', 'T5', 'T6', 'T7', 'T8'}, ...
@@ -970,7 +1068,7 @@ classdef ROVSimGUI < matlab.apps.AppBase
                                               'CellEditCallback', @(s, e) app.updateParameter('r_pos', s.Data, 'ThrusterConfigTable'));
 
             app.ControlPanel = uipanel(app.ParametersTab, 'Title', 'Control Parameters', ...
-                                       'Position', [910 60 450 350], 'FontWeight', 'bold');
+                                       'Position', [910 410 450 350], 'FontWeight', 'bold');
             uilabel(app.ControlPanel, 'Text', 'Pose PID Gains:', 'Position', [10 300 100 22], 'FontWeight', 'bold');
             app.GainsTable = uitable(app.ControlPanel, 'Units', 'normalized', 'Position', [0 0.55 1 0.35], ...
                                      'ColumnName', {'Kp', 'Ki', 'Kd'}, 'RowName', {'X', 'Y', 'Z', 'Roll', 'Pitch', 'Yaw'}, ...
@@ -1032,10 +1130,13 @@ classdef ROVSimGUI < matlab.apps.AppBase
             title(app.UIAxesRotationalDrag, 'Rotational Drag Fit');
 
             % PID Tuning Tab Components
-            app.TuningGoalDropDown = uidropdown(app.PIDTuningTab, 'Items', {'Optimized Tuning'}, ...
-                                                'Value', 'Optimized Tuning', 'Position', [50 650 200 22]);
+            app.TuningGoalDropDown = uidropdown(app.PIDTuningTab, 'Items', {'Fast Response', 'Minimal Overshoot', 'Balanced Performance'}, ...
+                                                'Value', 'Balanced Performance', 'Position', [50 650 200 22]);
             app.TunePIDButton = uibutton(app.PIDTuningTab, 'Text', 'Tune PID', 'Position', [50 610 100 25], ...
                                          'ButtonPushedFcn', @(s, e) app.TunePIDAutomatically(s, e));
+            app.TuningProgressLabel = uilabel(app.PIDTuningTab, 'Text', '', 'Position', [50 570 200 22], 'FontWeight', 'bold');
+            app.TuningResultsTextArea = uitextarea(app.PIDTuningTab, 'Position', [50 50 600 500], ...
+                                                   'FontSize', 12, 'Editable', 'off');
         end
     end
 
