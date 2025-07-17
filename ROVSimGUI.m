@@ -370,120 +370,129 @@ classdef ROVSimGUI < matlab.apps.AppBase
 
         % --- PID Tuning ---
         function TunePIDAutomatically(app, ~, ~)
-    % Automatically tune PID gains for ROV using manual tuning based on second-order model
-    app.TuningProgressLabel.Text = 'Tuning in progress...';
-    drawnow;
+    % Automatically tune cascade PID gains based on user-selected goal
+    try
+        % Switch to PID Tuning Tab
+        app.TabGroup.SelectedTab = app.PIDTuningTab;
+        app.TuningProgressLabel.Text = 'Initializing PID tuning...';
+        drawnow;
+
+        % Extract current parameters
+        p = app.simParams;
+        
+        % Define bounds for PID gains
+        % Outer loop (pose control): Kp, Ki, Kd
+        lb_pose = [0.1 * ones(6,1); zeros(6,1); 0.1 * ones(6,1)]; % Lower bounds
+        ub_pose = [10 * ones(6,1); 1 * ones(6,1); 5 * ones(6,1)]; % Upper bounds
+        % Inner loop (velocity control): Kv_p, Kv_i, Kv_d
+        lb_vel = [0.5 * ones(6,1); zeros(6,1); 0.5 * ones(6,1)];
+        ub_vel = [20 * ones(6,1); 2 * ones(6,1); 10 * ones(6,1)];
+        lb = [lb_pose; lb_vel];
+        ub = [ub_pose; ub_vel];
+
+        % Initial guess: Current PID gains
+        x0 = [diag(p.Kp); diag(p.Ki); diag(p.Kd); diag(p.Kv_p); diag(p.Kv_i); diag(p.Kv_d)];
+
+        % Define tuning goal weights
+        switch app.TuningGoalDropDown.Value
+            case 'Fast Response'
+                w_settle = 0.7; w_overshoot = 0.2; w_iae = 0.1;
+            case 'Minimal Overshoot'
+                w_settle = 0.2; w_overshoot = 0.7; w_iae = 0.1;
+            case 'Balanced Performance'
+                w_settle = 0.4; w_overshoot = 0.3; w_iae = 0.3;
+            otherwise
+                w_settle = 0.4; w_overshoot = 0.3; w_iae = 0.3;
+        end
+
+        % Optimization options
+        opts = optimoptions('fmincon', ...
+            'Display', 'iter', ...
+            'MaxIterations', 50, ...
+            'MaxFunctionEvaluations', 500, ...
+            'Algorithm', 'sqp', ...
+            'StepTolerance', 1e-6, ...
+            'ConstraintTolerance', 1e-6, ...
+            'OptimalityTolerance', 1e-6);
+
+        % Define objective function
+        objFun = @(x) evaluatePID(app, x, w_settle, w_overshoot, w_iae);
+
+        % Run optimization
+        app.TuningProgressLabel.Text = 'Running PID tuning optimization...';
+        drawnow;
+        tic;
+        [x_opt, fval, exitflag, output] = fmincon(objFun, x0, [], [], [], [], lb, ub, [], opts);
+        elapsed = toc;
+
+        % Update simParams with optimized gains
+        app.simParams.Kp = diag(x_opt(1:6));
+        app.simParams.Ki = diag(x_opt(7:12));
+        app.simParams.Kd = diag(x_opt(13:18));
+        app.simParams.Kv_p = diag(x_opt(19:24));
+        app.simParams.Kv_i = diag(x_opt(25:30));
+        app.simParams.Kv_d = diag(x_opt(31:36));
+
+        % Update GUI tables
+        app.GainsTable.Data = [diag(app.simParams.Kp), diag(app.simParams.Ki), diag(app.simParams.Kd)];
+        app.VelocityGainsTable.Data = [diag(app.simParams.Kv_p), diag(app.simParams.Kv_i), diag(app.simParams.Kv_d)];
+        app.saveParametersToMat();
+
+        % Display tuning results
+        resultsStr = sprintf('PID Tuning Results:\n\n');
+        resultsStr = [resultsStr, sprintf('Tuning Goal: %s\n', app.TuningGoalDropDown.Value)];
+        resultsStr = [resultsStr, sprintf('Optimization Time: %.2f s\n', elapsed)];
+        resultsStr = [resultsStr, sprintf('Objective Function Value: %.4f\n', fval)];
+        resultsStr = [resultsStr, sprintf('Iterations: %d\n', output.iterations)];
+        resultsStr = [resultsStr, sprintf('Exit Flag: %d (%s)\n', exitflag, output.message)];
+        resultsStr = [resultsStr, sprintf('\nOptimized Pose PID Gains:\n')];
+        coords = {'X', 'Y', 'Z', 'Roll', 'Pitch', 'Yaw'};
+        for i = 1:6
+            resultsStr = [resultsStr, sprintf('  %s: Kp=%.4f, Ki=%.4f, Kd=%.4f\n', ...
+                coords{i}, x_opt(i), x_opt(i+6), x_opt(i+12))];
+        end
+        resultsStr = [resultsStr, sprintf('\nOptimized Velocity PID Gains:\n')];
+        for i = 1:6
+            resultsStr = [resultsStr, sprintf('  %s: Kv_p=%.4f, Kv_i=%.4f, Kv_d=%.4f\n', ...
+                coords{i}, x_opt(i+18), x_opt(i+24), x_opt(i+30))];
+        end
+        app.TuningResultsTextArea.Value = resultsStr;
+        app.TuningProgressLabel.Text = 'Tuning completed successfully.';
+        uialert(app.UIFigure, 'PID tuning completed successfully.', 'Success', 'Icon', 'success');
+
+        % Run simulation with optimized gains
+        app.TuningProgressLabel.Text = 'Running simulation with optimized gains...';
+        drawnow;
+        app.RunSim([], []);
+
+    catch ME
+        app.TuningProgressLabel.Text = 'Tuning failed.';
+        uialert(app.UIFigure, sprintf('PID tuning error: %s', ME.message), 'Error', 'Icon', 'error');
+    end
+end
+
+% Helper function to evaluate PID performance
+function cost = evaluatePID(app, x, w_settle, w_overshoot, w_iae)
+    % Temporarily update PID gains
+    app.simParams.Kp = diag(x(1:6));
+    app.simParams.Ki = diag(x(7:12));
+    app.simParams.Kd = diag(x(13:18));
+    app.simParams.Kv_p = diag(x(19:24));
+    app.simParams.Kv_i = diag(x(25:30));
+    app.simParams.Kv_d = diag(x(31:36));
+
+    % Run simulation (simplified version to reduce computation time)
+    p = app.simParams;
+    N = round(p.t_final / p.ts);
+    app.timeVec = (0:N-1) * p.ts;
+    app.stateHistory = zeros(12, N);
+    app.thrustHistory = zeros(8, N);
+    app.errorHistory = zeros(6, N);
 
     try
-        % Ensure simParams is initialized
-        if isempty(app.simParams)
-            app.initializeDefaultParameters();
-        end
-        p = app.simParams;
-
-        % Validate critical parameters
-        requiredFields = {'mass', 'added', 'I', 'CdA', 'D_rot', 'ts', 'maxThrust', 'r_pos', 'dir_thr', 'desired'};
-        missingFields = requiredFields(~isfield(p, requiredFields));
-        if ~isempty(missingFields)
-            error('Missing simParams fields: %s', strjoin(missingFields, ', '));
-        end
-        if size(p.added, 1) ~= 6 || size(p.added, 2) ~= 6
-            error('Added mass matrix must be 6x6.');
-        end
-        if size(p.I, 1) ~= 3 || size(p.I, 2) ~= 3
-            error('Inertia matrix must be 3x3.');
-        end
-        if length(p.CdA) ~= 3
-            error('CdA must be a 3x1 vector.');
-        end
-        if size(p.D_rot, 1) ~= 3 || size(p.D_rot, 2) ~= 3
-            error('D_rot must be a 3x3 matrix.');
-        end
-        if size(p.r_pos, 1) ~= 8 || size(p.r_pos, 2) ~= 3
-            error('r_pos must be 8x3.');
-        end
-        if size(p.dir_thr, 1) ~= 8 || size(p.dir_thr, 2) ~= 3
-            error('dir_thr must be 8x3.');
-        end
-        if length(p.desired) ~= 6
-            error('desired must be a 6x1 vector.');
-        end
-
-        % Initialize gains
-        Kp = zeros(6, 1); Ki = zeros(6, 1); Kd = zeros(6, 1);
-        Kv_p = zeros(6, 1); Kv_i = zeros(6, 1); Kv_d = zeros(6, 1);
-        overshoot_data = zeros(6, 1);
-        settling_time = zeros(6, 1);
-
-        % Define plant models for each DOF
-        s = tf('s');
-        G_trans = cell(3, 1); % Translational DOFs (x, y, z)
-        G_rot = cell(3, 1);   % Rotational DOFs (roll, pitch, yaw)
-        for i = 1:3
-            mass_total = p.mass + p.added(i,i);
-            if mass_total <= 0
-                error('Invalid mass for axis %d: must be positive.', i);
-            end
-            G_trans{i} = 1 / (mass_total * s^2 + p.CdA(i) * s);
-        end
-        for i = 1:3
-            inertia_total = p.I(i,i) + p.added(i+3,i+3);
-            if inertia_total <= 0
-                error('Invalid inertia for axis %d: must be positive.', i);
-            end
-            G_rot{i} = 1 / (inertia_total * s^2 + p.D_rot(i,i) * s);
-        end
-
-        % Tuning parameters
-        tuningGoal = app.TuningGoalDropDown.Value;
-        switch tuningGoal
-            case 'Fast Response'
-                wc_pose = 0.7; % Bandwidth (rad/s)
-                wc_vel = 1.4;
-                pm_pose = 60; % Phase margin (degrees)
-                pm_vel = 70;
-            case 'Minimal Overshoot'
-                wc_pose = 0.3;
-                wc_vel = 0.6;
-                pm_pose = 80;
-                pm_vel = 90;
-            case 'Balanced Performance'
-                wc_pose = 0.5;
-                wc_vel = 1.0;
-                pm_pose = 65;
-                pm_vel = 75;
-            otherwise
-                error('Invalid tuning goal: %s', tuningGoal);
-        end
-
-        % Tune PID gains manually
-        for i = 1:6
-            if i <= 3
-                G = G_trans{i};
-                m = p.mass + p.added(i,i);
-                b = p.CdA(i);
-            else
-                G = G_rot{i-3};
-                m = p.I(i-3,i-3) + p.added(i+3,i+3);
-                b = p.D_rot(i-3,i-3);
-            end
-            % Pose loop: Kp = m * wc^2, Kd = 2 * m * wc * zeta, Ki = Kp * wc / 10
-            zeta_pose = sqrt(1 - (pm_pose * pi/180)^2) / (pm_pose * pi/180); % Damping ratio from phase margin
-            Kp(i) = max(m * wc_pose^2, 0.5);
-            Kd(i) = max(2 * m * wc_pose * zeta_pose, 0.5);
-            Ki(i) = max(Kp(i) * wc_pose / 10, 0.01);
-            % Velocity loop: more aggressive
-            zeta_vel = sqrt(1 - (pm_vel * pi/180)^2) / (pm_vel * pi/180);
-            Kv_p(i) = max(m * wc_vel^2, 1.0);
-            Kv_i(i) = max(Kv_p(i) * wc_vel / 8, 0.05);
-            Kv_d(i) = max(2 * m * wc_vel * zeta_vel, 1.0);
-        end
-
-        % Validate gains with closed-loop simulation
-        ts = p.ts;
-        t_sim = 0:ts:10; % 10s for validation
         M = [p.mass * eye(3) + p.added(1:3,1:3), zeros(3); zeros(3), p.I + p.added(4:6,4:6)];
-        invM = inv(M);
+        invM_lin = inv(M(1:3,1:3));
+        invM_ang = inv(M(4:6,4:6));
         A = zeros(6, 8);
         for i = 1:8
             d = p.dir_thr(i, :)';
@@ -492,119 +501,117 @@ classdef ROVSimGUI < matlab.apps.AppBase
             A(4:6, i) = cross(r, d);
         end
         Q = A' * A + 1e-3 * eye(8);
-        opts_qp = optimoptions('quadprog', 'Display', 'off');
+        opts = optimoptions('quadprog', 'Display', 'off');
 
-        for i = 1:6
-            state = zeros(12, 1);
-            y = zeros(length(t_sim), 1);
-            integral = 0;
-            prev_error = 0;
-            v_integral = 0;
-            v_prev_error = 0;
-            step_size = (i <= 3) * 1 + (i > 3) * 0.1; % 1m for trans, 0.1rad for rot
-            for k = 1:length(t_sim)
-                if i > 6 || i < 1
-                    error('Invalid DOF index %d: must be between 1 and 6.', i);
+        state = zeros(12, 1);
+        intErr = zeros(6, 1);
+        prevErr = p.desired;
+        v_intErr = zeros(6, 1);
+        v_prevErr = zeros(6, 1);
+        thr_e = zeros(8, 1);
+        thr_a = zeros(8, 1);
+        Tmax = p.maxThrust;
+        tau_e = 0.05;
+        tau_m = 0.15;
+        alpha_e = p.ts / (tau_e + p.ts);
+        alpha_m = p.ts / (tau_m + p.ts);
+
+        app.errorHistory(:, 1) = p.desired - state(1:6);
+
+        for k = 2:N
+            err = p.desired - state(1:6);
+            app.errorHistory(:, k) = err;
+            intErr = intErr + err * p.ts;
+            dErr = (err - prevErr) / p.ts;
+            prevErr = err;
+            v_desired = p.Kp * err + p.Ki * intErr + p.Kd * dErr;
+
+            v_err = v_desired - state(7:12);
+            v_intErr = v_intErr + v_err * p.ts;
+            v_dErr = (v_err - v_prevErr) / p.ts;
+            v_prevErr = v_err;
+            tau = p.Kv_p * v_err + p.Kv_i * v_intErr + p.Kv_d * v_dErr;
+
+            tc = quadprog(Q, -A' * tau, [], [], [], [], -Tmax * ones(8, 1), Tmax * ones(8, 1), [], opts);
+            app.thrustHistory(:, k) = tc;
+
+            thr_e = alpha_e * tc + (1 - alpha_e) * thr_e;
+            thr_a = alpha_m * thr_e + (1 - alpha_m) * thr_a;
+
+            vLin = state(7:9);
+            vRot = state(10:12);
+            if ~isempty(p.polyDragLin)
+                F = zeros(3, 1);
+                for i = 1:3
+                    F(i) = polyval(p.polyDragLin(i, :), vLin(i));
                 end
-                pose_error = step_size - state(i);
-                integral = integral + pose_error * ts;
-                derivative = (pose_error - prev_error) / ts;
-                vel_des = Kp(i) * pose_error + Ki(i) * integral + Kd(i) * derivative;
-                vel_error = vel_des - state(6+i);
-                v_integral = v_integral + vel_error * ts;
-                v_derivative = (vel_error - v_prev_error) / ts;
-                u = zeros(6, 1);
-                u(i) = Kv_p(i) * vel_error + Kv_i(i) * v_integral + Kv_d(i) * v_derivative;
-                tc = quadprog(Q, -A' * u, [], [], [], [], -p.maxThrust * ones(8, 1), p.maxThrust * ones(8, 1), [], opts_qp);
-                F = A * tc;
-                vLin = state(7:9);
-                vRot = state(10:12);
-                drag_lin = -p.CdA .* abs(vLin) .* vLin;
-                drag_rot = -p.D_rot * vRot;
-                F(1:3) = F(1:3) + drag_lin + [0; 0; (p.Fb - p.mass * 9.81)];
-                r_cob = p.cob - p.com;
-                F(4:6) = F(4:6) + drag_rot + cross(r_cob, [0; 0; p.Fb]);
-                acc = invM * F;
-                state(7:12) = state(7:12) + acc * ts;
-                state(1:6) = state(1:6) + state(7:12) * ts;
-                y(k) = state(i);
-                prev_error = pose_error;
-                v_prev_error = vel_error;
-            end
-            overshoot_data(i) = max(0, max(y) - step_size) / step_size;
-            settling_idx = find(abs(y - step_size) > 0.05 * step_size, 1, 'last');
-            if isempty(settling_idx)
-                settling_time(i) = t_sim(end);
             else
-                settling_time(i) = t_sim(min(settling_idx + 1, length(t_sim)));
+                F = -p.CdA .* abs(vLin) .* vLin;
             end
+            if ~isempty(p.polyDragRot)
+                M_t = zeros(3, 1);
+                for i = 1:3
+                    M_t(i) = polyval(p.polyDragRot(i, :), vRot(i));
+                end
+            else
+                M_t = -p.D_rot * vRot;
+            end
+            TF = A * thr_a;
+            F = F + TF(1:3);
+            buoyancy_force = [0; 0; p.Fb];
+            weight_force = [0; 0; -p.mass * 9.81];
+            r_cob = p.cob - p.com;
+            M_buoyancy = cross(r_cob, buoyancy_force);
+            F = F + buoyancy_force + weight_force;
+            M_t = M_t + TF(4:6) + M_buoyancy;
 
-            % Adjust gains if performance is poor
-            if overshoot_data(i) > 0.10 || settling_time(i) > 6
-                Kp(i) = Kp(i) * 0.7;
-                Ki(i) = Ki(i) * 0.5;
-                Kd(i) = Kd(i) * 0.8;
-                Kv_p(i) = Kv_p(i) * 0.7;
-                Kv_i(i) = Kv_i(i) * 0.5;
-                Kv_d(i) = Kv_d(i) * 0.8;
+            acc_lin = invM_lin * F;
+            acc_ang = invM_ang * M_t;
+            state(7:9) = state(7:9) + acc_lin * p.ts;
+            state(10:12) = state(10:12) + acc_ang * p.ts;
+            state(1:3) = state(1:3) + state(7:9) * p.ts + 0.5 * acc_lin * p.ts^2;
+            state(4:6) = state(4:6) + state(10:12) * p.ts + 0.5 * acc_ang * p.ts^2;
+            app.stateHistory(:, k) = state;
+        end
+
+        % Compute performance metrics
+        desired_norm = max(abs(p.desired), [0.1; 0.1; 0.1; 0.01; 0.01; 0.01]);
+        thresholds = 0.05 * desired_norm;
+        settling_times = zeros(6, 1);
+        overshoots = max(abs(app.errorHistory), [], 2);
+        iae = sum(abs(app.errorHistory), 2) * p.ts;
+
+        for i = 1:6
+            err = abs(app.errorHistory(i, :));
+            idx = find(err < thresholds(i), 5, 'first');
+            if length(idx) == 5 && all(diff(idx) == 1) && idx(1) > 1
+                settling_times(i) = app.timeVec(idx(1));
+            else
+                settling_times(i) = p.t_final; % Penalize if not settled
             end
         end
 
-        % Gain scheduling based on desired pose
-        desired_norm = norm(p.desired(1:3));
-        if desired_norm > 10
-            Kp = Kp * 1.1; % Modest increase
-            Kv_p = Kv_p * 1.1;
-        elseif desired_norm < 2
-            Kp = Kp * 0.9; % Modest decrease
-            Kv_p = Kv_p * 0.9;
+        % Normalize metrics
+        settle_cost = mean(settling_times / p.t_final);
+        overshoot_cost = mean(overshoots ./ desired_norm);
+        iae_cost = mean(iae ./ desired_norm);
+
+        % Combine costs with weights
+        cost = w_settle * settle_cost + w_overshoot * overshoot_cost + w_iae * iae_cost;
+
+        % Penalize unstable or divergent behavior
+        if any(isnan(app.stateHistory(:)) | isinf(app.stateHistory(:)))
+            cost = cost + 1e6;
         end
 
-        % Apply tuned gains
-        app.simParams.Kp = diag(Kp);
-        app.simParams.Ki = diag(Ki);
-        app.simParams.Kd = diag(Kd);
-        app.simParams.Kv_p = diag(Kv_p);
-        app.simParams.Kv_i = diag(Kv_i);
-        app.simParams.Kv_d = diag(Kv_d);
+        % Update progress
+        app.TuningProgressLabel.Text = sprintf('Evaluating: Cost = %.4f (Settle: %.2f, Overshoot: %.2f, IAE: %.2f)', ...
+            cost, settle_cost, overshoot_cost, iae_cost);
+        drawnow;
 
-        % Update UI tables
-        app.GainsTable.Data = [Kp, Ki, Kd];
-        app.VelocityGainsTable.Data = [Kv_p, Kv_i, Kv_d];
-        app.saveParametersToMat();
-
-        % Display tuning results
-        resultsStr = sprintf('PID Tuning Results (%s, Manual Tuning):\n\n', tuningGoal);
-        resultsStr = [resultsStr, sprintf('Model Parameters Used:\n')];
-        for i = 1:3
-            resultsStr = [resultsStr, sprintf('  Trans Axis %d: Mass=%.2f kg, Damping=%.2f Ns/m\n', ...
-                i, p.mass + p.added(i,i), p.CdA(i))];
-        end
-        for i = 1:3
-            resultsStr = [resultsStr, sprintf('  Rot Axis %d: Inertia=%.2f kg·m², Damping=%.2f Nms/rad\n', ...
-                i, p.I(i,i) + p.added(i+3,i+3), p.D_rot(i,i))];
-        end
-        resultsStr = [resultsStr, sprintf('\nPose PID Gains (Phase Margin: %.1f°):\n', pm_pose)];
-        for i = 1:6
-            resultsStr = [resultsStr, sprintf('  Axis %d: Kp=%.4f, Ki=%.4f, Kd=%.4f\n', ...
-                i, Kp(i), Ki(i), Kd(i))];
-        end
-        resultsStr = [resultsStr, sprintf('\nVelocity PID Gains (Phase Margin: %.1f°):\n', pm_vel)];
-        for i = 1:6
-            resultsStr = [resultsStr, sprintf('  Axis %d: Kv_p=%.4f, Kv_i=%.4f, Kv_d=%.4f\n', ...
-                i, Kv_p(i), Kv_i(i), Kv_d(i))];
-        end
-        resultsStr = [resultsStr, sprintf('\nPerformance Metrics:\n')];
-        for i = 1:6
-            resultsStr = [resultsStr, sprintf('  Axis %d: Overshoot=%.2f%%, Settling Time=%.2fs\n', ...
-                i, overshoot_data(i)*100, settling_time(i))];
-        end
-        app.TuningResultsTextArea.Value = resultsStr;
-        app.TuningProgressLabel.Text = 'Tuning completed successfully.';
-        uialert(app.UIFigure, sprintf('PID tuning completed for %s.', tuningGoal), 'Success', 'Icon', 'success');
     catch ME
-        app.TuningProgressLabel.Text = 'Tuning failed.';
-        uialert(app.UIFigure, sprintf('PID tuning error: %s', ME.message), 'Error', 'Icon', 'error');
+        warning('ROVSimGUI:SimFailed', '%s', ME.message); % Corrected warning syntax
+        cost = 1e6; % High cost for failed simulation
     end
 end
         % --- Simulation Execution ---
